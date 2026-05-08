@@ -2,6 +2,37 @@ import React, { useEffect, useState } from 'react';
 import useStore from '../../store/useStore';
 import { eciToLla } from '../../utils/coords';
 
+const computeSpeedKmh = (velocity) => {
+  if (!velocity) return null;
+  const vx = Number(velocity.vx ?? velocity.x ?? 0);
+  const vy = Number(velocity.vy ?? velocity.y ?? 0);
+  const vz = Number(velocity.vz ?? velocity.z ?? 0);
+  if ([vx, vy, vz].some((value) => Number.isNaN(value))) return null;
+  return Math.sqrt((vx * vx) + (vy * vy) + (vz * vz)) * 3600;
+};
+
+const computeAltitudeKm = (position) => {
+  if (!position) return null;
+  const x = Number(position.x ?? 0);
+  const y = Number(position.y ?? 0);
+  const z = Number(position.z ?? 0);
+  if ([x, y, z].some((value) => Number.isNaN(value))) return null;
+  return Math.sqrt((x * x) + (y * y) + (z * z)) - 6371.0;
+};
+
+const enrichSatellite = (sat) => {
+  if (!sat) return sat;
+
+  const speedKmh = sat.speed_kmh != null ? sat.speed_kmh : computeSpeedKmh(sat.velocity);
+  const altitudeKm = sat.altitude_km != null ? sat.altitude_km : computeAltitudeKm(sat.position);
+
+  return {
+    ...sat,
+    speed_kmh: speedKmh,
+    altitude_km: altitudeKm,
+  };
+};
+
 const TelemetryPanel = () => {
   const selectedSatelliteId = useStore((s) => s.selectedSatelliteId);
   const satellites = useStore((s) => s.satellites);
@@ -26,7 +57,7 @@ const TelemetryPanel = () => {
         satellites.find((satellite) => satellite.norad_id === selectedSatelliteId) ||
         null;
 
-      setSatelliteDetail(fallbackSatellite);
+      setSatelliteDetail(enrichSatellite(fallbackSatellite));
 
       try {
         const resp = await fetch(`${apiBaseUrl}/api/satellites/${selectedSatelliteId}`);
@@ -34,7 +65,10 @@ const TelemetryPanel = () => {
 
         const data = await resp.json();
         if (!cancelled) {
-          setSatelliteDetail(data);
+          setSatelliteDetail(enrichSatellite({
+            ...fallbackSatellite,
+            ...data,
+          }));
         }
       } catch (error) {
         console.error('Selected satellite detail fetch failed:', error);
@@ -98,8 +132,8 @@ const TelemetryPanel = () => {
 
   const now = new Date();
   const lla = eciToLla(sat.position, now);
-  const speedText = sat.speed_kmh != null ? sat.speed_kmh.toLocaleString() : '---';
-  const heightText = sat.altitude_km != null ? Math.round(sat.altitude_km).toLocaleString() : '---';
+  const speedText = sat.speed_kmh != null ? Number(sat.speed_kmh).toLocaleString() : '---';
+  const heightText = sat.altitude_km != null ? Math.round(Number(sat.altitude_km)).toLocaleString() : '---';
   const latitudeText = lla.lat != null ? lla.lat.toFixed(2) : '---';
   const longitudeText = lla.lon != null ? lla.lon.toFixed(2) : '---';
 

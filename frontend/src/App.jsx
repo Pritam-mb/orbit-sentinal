@@ -23,6 +23,8 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     let reconnectTimer = null;
+    let satellitePollTimer = null;
+    let alertPollTimer = null;
 
     const bootstrapSatellites = async () => {
       try {
@@ -95,10 +97,24 @@ function App() {
     bootstrapAlerts();
     connect();
 
+    satellitePollTimer = setInterval(() => {
+      bootstrapSatellites();
+    }, 1000);
+
+    alertPollTimer = setInterval(() => {
+      bootstrapAlerts();
+    }, 30000);
+
     return () => {
       cancelled = true;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
+      }
+      if (satellitePollTimer) {
+        clearInterval(satellitePollTimer);
+      }
+      if (alertPollTimer) {
+        clearInterval(alertPollTimer);
       }
       if (wsRef.current) {
         wsRef.current.close();

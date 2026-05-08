@@ -16,8 +16,8 @@ The frontend is a React + Cesium dashboard that renders a globe, shows live sate
 2. A background loop refreshes propagated satellite state every second.
 3. A slower background loop refreshes conjunction alerts from the latest cached states.
 4. The WebSocket broadcaster pushes the latest snapshot to connected clients at 1 Hz.
-5. `frontend/src/App.jsx` bootstraps the first snapshot and alert list through REST, then opens the WebSocket stream for live updates.
-6. `frontend/src/components/Globe/CesiumGlobe.jsx` renders satellites on the globe and keeps the scene in sync with the store.
+5. `frontend/src/App.jsx` bootstraps the first snapshot and alert list through REST, keeps a satellite polling fallback running, then opens the WebSocket stream for live updates.
+6. `frontend/src/components/Globe/CesiumGlobe.jsx` renders satellites on the globe and keeps the scene in sync with the store using live position and velocity data.
 7. `frontend/src/components/Telemetry/TelemetryPanel.jsx` fetches detailed state for the selected satellite and orbit track samples.
 8. `frontend/src/components/TestModePanel.jsx` configures deterministic two-satellite scenarios for the test workflow.
 9. `frontend/src/components/Control/ManualControl.jsx` and `frontend/src/components/Control/PreflightModal.jsx` handle the maneuver demo flow.
@@ -232,6 +232,7 @@ hackolution/
 
 - `frontend/src/App.jsx` is the top-level UI container.
   - It boots the initial satellite and alert data with REST calls.
+  - It polls satellites as a fallback so the globe keeps animating even if the WebSocket stalls.
   - It opens the satellite WebSocket and reconnects if the socket closes.
   - It keeps the main store in sync with snapshot timestamps, satellites, alerts, and connection state.
   - It renders the globe panel on the left and the control/sidebar stack on the right.
@@ -269,6 +270,7 @@ hackolution/
   - It creates a Cesium viewer without the default UI chrome.
   - It uses `frontend/public/earth-realistic-8k.webp` as the globe texture.
   - It renders satellites as billboards, labels the hovered object, and draws the selected orbit track.
+  - It uses backend-provided velocity where available so satellites keep moving smoothly between updates.
   - It highlights the selected satellite, hovered satellite, and test-mode satellites with different colors and scales.
   - It also draws a line between the two override satellites when test mode is active.
   - It uses `VITE_CESIUM_TOKEN` if a Cesium Ion token is provided in the environment.

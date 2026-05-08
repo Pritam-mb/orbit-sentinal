@@ -50,6 +50,14 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
                 "y": state.y,
                 "z": state.z,
             },
+            "velocity": {
+                "vx": state.vx,
+                "vy": state.vy,
+                "vz": state.vz,
+            },
+            "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
+            "altitude_km": round(float(((state.x**2 + state.y**2 + state.z**2) ** 0.5) - 6371.0), 2),
+            "epoch_utc": state.epoch_utc,
         }
         for state in active_states
     ]
