@@ -10,6 +10,7 @@ const ManualControl = () => {
   const resetManeuver = useStore((s) => s.resetManeuver);
   const setAlerts = useStore((s) => s.setAlerts);
   const setCascadePlan = useStore((s) => s.setCascadePlan);
+  const setHotspots = useStore((s) => s.setHotspots);
   const selectedSatelliteId = useStore((s) => s.selectedSatelliteId);
   const selectedSatellite = useStore((s) => {
     if (!s.selectedSatelliteId) return null;
@@ -19,13 +20,15 @@ const ManualControl = () => {
   const [showPreflight, setShowPreflight] = useState(false);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const totalDeltaV = Math.sqrt((maneuver.dvx ** 2) + (maneuver.dvy ** 2) + (maneuver.dvz ** 2));
+  const burnReady = totalDeltaV > 0.01;
 
   const handleSliderChange = (axis, value) => {
     setManeuver(axis, parseFloat(value));
   };
 
   const handleExecute = () => {
-    if (!selectedSatelliteId) return;
+    if (!selectedSatelliteId || !burnReady) return;
     setShowPreflight(true);
   };
 
@@ -50,6 +53,9 @@ const ManualControl = () => {
       const data = await resp.json();
       if (data?.alerts) {
         setAlerts(data.alerts || []);
+      }
+      if (Object.prototype.hasOwnProperty.call(data, 'hotspots')) {
+        setHotspots(data.hotspots || []);
       }
       if (Object.prototype.hasOwnProperty.call(data, 'cascade_plan')) {
         setCascadePlan({
@@ -130,7 +136,7 @@ const ManualControl = () => {
       ))}
 
       <div className="threshold-note mono">
-        Total delta-V: {Math.sqrt((maneuver.dvx ** 2) + (maneuver.dvy ** 2) + (maneuver.dvz ** 2)).toFixed(3)} m/s
+        Total delta-V: {totalDeltaV.toFixed(3)} m/s
       </div>
 
       <div className="btn-row" style={{ marginTop: 12 }}>
@@ -141,9 +147,9 @@ const ManualControl = () => {
           className="btn btn-execute"
           type="button"
           onClick={handleExecute}
-          disabled={!selectedSatelliteId || loading}
+          disabled={!selectedSatelliteId || loading || !burnReady}
         >
-          {loading ? 'Applying...' : 'Run Preflight + Burn'}
+          {loading ? 'Applying...' : (burnReady ? 'Run Preflight + Burn' : 'Set a non-zero burn')}
         </button>
       </div>
 

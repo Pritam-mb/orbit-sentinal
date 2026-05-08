@@ -16,6 +16,7 @@ function App() {
   const setSnapshotTimestamp = useStore((s) => s.setSnapshotTimestamp);
   const setAlerts = useStore((s) => s.setAlerts);
   const setCascadePlan = useStore((s) => s.setCascadePlan);
+  const setHotspots = useStore((s) => s.setHotspots);
   const setWsConnected = useStore((s) => s.setWsConnected);
   const wsConnected = useStore((s) => s.wsConnected);
   const satellites = useStore((s) => s.satellites);
@@ -50,6 +51,7 @@ function App() {
         if (!cancelled) {
           setAlerts(alertData.alerts || []);
           setCascadePlan(alertData.cascade_plan || null);
+          setHotspots(alertData.hotspots || []);
         }
       } catch (error) {
         console.error('Initial alert bootstrap failed:', error);
@@ -123,7 +125,7 @@ function App() {
         wsRef.current.close();
       }
     };
-  }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setWsConnected]);
+  }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setHotspots, setWsConnected]);
 
   return (
     <div className="app-container">

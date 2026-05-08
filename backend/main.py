@@ -19,7 +19,7 @@ from app.core.state_cache import (
     set_latest_alerts,
     set_latest_snapshot,
 )
-from app.data.tle_fetcher import load_local_tles
+from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
 from app.services.cascade_planner import CascadePlanner
 from app.api.ws_handler import ConnectionManager, satellite_broadcast_loop
@@ -127,12 +127,15 @@ async def refresh_alerts_loop():
                     cascade_planner.analyze_snapshot,
                     sampled_states,
                     [alert.to_dict() for alert in alerts],
+                    propagator,
+                    snapshot.get("timestamp") and datetime.fromisoformat(snapshot["timestamp"]),
                 )
 
             set_latest_alerts({
                 "timestamp": snapshot.get("timestamp"),
                 "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
                 "count": len(alerts),
+                "hotspots": cascade_summary.get("hotspots", []),
                 "graph": cascade_summary.get("graph", {}),
                 "cascade_plan": cascade_summary.get("cascade_plan", []),
                 "cascade_depth": cascade_summary.get("cascade_depth", 0),
@@ -155,14 +158,14 @@ async def lifespan(app: FastAPI):
     """Startup: fetch TLEs and begin broadcast loop."""
     logger.info("=== Orbital Sentinel starting ===")
 
-    # Load the bundled snapshot immediately so the API starts fast.
-    local_tles = load_local_tles(max_sats=0)
-    propagator.load_tles(local_tles)
-    logger.info(f"Tracking {propagator.satellite_count} satellites from local snapshot")
+    # Load live TLEs when Space-Track credentials are configured, otherwise fall back.
+    tles = await fetch_tles(max_sats=0)
+    propagator.load_tles(tles)
+    logger.info(f"Tracking {propagator.satellite_count} satellites from current TLE source")
 
     now = datetime.now(timezone.utc)
     set_latest_snapshot(await asyncio.to_thread(build_snapshot, propagator, now))
-    set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0})
+    set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0, "hotspots": []})
 
     # Initialize REST routes with shared instances
     init_routes(propagator, sim_engine)
