@@ -1,84 +1,326 @@
-"""
-XGBoost Risk Scorer — deterministic heuristic fallback.
-
-The interface is kept model-friendly, but the scoring logic is now stable
-so CPI and cascade ranking are repeatable on every refresh.
-"""
+from __future__ import annotations
 
 import logging
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+try:
+    import joblib
+    import xgboost as xgb
+except Exception:
+    joblib = None
+    xgb = None
+
+from .artifacts import load_artifact, save_artifact
+from .synthetic_data import generate_risk_dataset, sigmoid
+
 
 logger = logging.getLogger(__name__)
+
+RISK_ARTIFACT = "risk_model.json"
+RISK_ARTIFACT_JOBLIB = "risk_model.joblib"
+
+
+@dataclass
+class DecisionStump:
+    feature_index: int
+    threshold: float
+    left_value: float
+    right_value: float
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        mask = features[:, self.feature_index] <= self.threshold
+        return np.where(mask, self.left_value, self.right_value)
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "feature_index": int(self.feature_index),
+            "threshold": float(self.threshold),
+            "left_value": float(self.left_value),
+            "right_value": float(self.right_value),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "DecisionStump":
+        return cls(
+            feature_index=int(payload["feature_index"]),
+            threshold=float(payload["threshold"]),
+            left_value=float(payload["left_value"]),
+            right_value=float(payload["right_value"]),
+        )
+
+
+class BoostedRiskModel:
+    def __init__(
+        self,
+        base_logit: float,
+        learning_rate: float,
+        stumps: list[DecisionStump],
+        feature_names: list[str],
+    ):
+        self.base_logit = float(base_logit)
+        self.learning_rate = float(learning_rate)
+        self.stumps = stumps
+        self.feature_names = feature_names
+
+    def predict_row(self, row: np.ndarray) -> float:
+        raw = self.base_logit
+        row_2d = row.reshape(1, -1)
+        for stump in self.stumps:
+            raw += self.learning_rate * float(stump.predict(row_2d)[0])
+        return float(sigmoid(raw))
+
+    def predict_batch(self, matrix: np.ndarray) -> np.ndarray:
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(1, -1)
+
+        raw = np.full(matrix.shape[0], self.base_logit, dtype=float)
+        for stump in self.stumps:
+            raw += self.learning_rate * stump.predict(matrix)
+        return sigmoid(raw).astype(float)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "base_logit": float(self.base_logit),
+            "learning_rate": float(self.learning_rate),
+            "feature_names": list(self.feature_names),
+            "stumps": [stump.to_dict() for stump in self.stumps],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "BoostedRiskModel":
+        return cls(
+            base_logit=float(payload["base_logit"]),
+            learning_rate=float(payload["learning_rate"]),
+            stumps=[DecisionStump.from_dict(item) for item in payload.get("stumps", [])],
+            feature_names=list(payload.get("feature_names", [])),
+        )
+
+
+def _best_stump(features: np.ndarray, residual: np.ndarray) -> DecisionStump | None:
+    best_stump = None
+    best_loss = math.inf
+
+    for feature_index in range(features.shape[1]):
+        column = features[:, feature_index]
+        thresholds = np.unique(np.quantile(column, np.linspace(0.1, 0.9, 9)))
+
+        for threshold in thresholds:
+            left_mask = column <= threshold
+            right_mask = ~left_mask
+            if not left_mask.any() or not right_mask.any():
+                continue
+
+            left_value = float(residual[left_mask].mean())
+            right_value = float(residual[right_mask].mean())
+            predictions = np.where(left_mask, left_value, right_value)
+            loss = float(np.mean((residual - predictions) ** 2))
+
+            if loss < best_loss:
+                best_loss = loss
+                best_stump = DecisionStump(
+                    feature_index=feature_index,
+                    threshold=float(threshold),
+                    left_value=left_value,
+                    right_value=right_value,
+                )
+
+    return best_stump
+
+
+def train_risk_model(
+    sample_count: int = 4096,
+    rounds: int = 24,
+    learning_rate: float = 0.18,
+    seed: int = 7,
+) -> BoostedRiskModel:
+    features, targets, feature_names = generate_risk_dataset(sample_count=sample_count, seed=seed)
+    base_prob = float(np.clip(targets.mean(), 1e-4, 1.0 - 1e-4))
+    base_logit = float(np.log(base_prob / (1.0 - base_prob)))
+    raw_scores = np.full(features.shape[0], base_logit, dtype=float)
+
+    stumps: list[DecisionStump] = []
+    for _ in range(rounds):
+        probabilities = sigmoid(raw_scores)
+        residual = targets - probabilities
+        stump = _best_stump(features, residual)
+        if stump is None:
+            break
+
+        stumps.append(stump)
+        raw_scores += learning_rate * stump.predict(features)
+
+    model = BoostedRiskModel(
+        base_logit=base_logit,
+        learning_rate=learning_rate,
+        stumps=stumps,
+        feature_names=feature_names,
+    )
+    save_artifact(
+        RISK_ARTIFACT,
+        {
+            "trained_from": "synthetic_conjunctions",
+            "sample_count": sample_count,
+            "rounds": rounds,
+            "model": model.to_dict(),
+        },
+    )
+    logger.info("Trained risk model with %d stumps", len(stumps))
+    return model
+
+
+def load_or_train_risk_model(retrain: bool = False) -> BoostedRiskModel:
+    # Prefer a real XGBoost artifact if available
+    from .artifacts import artifact_path
+
+    if not retrain:
+        # Try joblib xgboost model first
+        try:
+            if joblib is not None:
+                path = artifact_path(RISK_ARTIFACT_JOBLIB)
+                if path.exists():
+                    clf = joblib.load(path)
+                    # Wrap sklearn/xgboost model in a simple adapter
+                    class XGBWrapper:
+                        def __init__(self, model):
+                            self.model = model
+
+                        def predict_proba(self, X):
+                            return self.model.predict_proba(X)
+
+                    wrapper = XGBWrapper(clf)
+                    logger.info("Loaded XGBoost risk model from %s", path)
+                    return _wrap_xgb_as_boosted(wrapper, feature_names=None)
+        except Exception:
+            logger.debug("Failed to load joblib xgboost model, falling back")
+
+        payload = load_artifact(RISK_ARTIFACT)
+        if payload and "model" in payload:
+            return BoostedRiskModel.from_dict(payload["model"])
+
+    return train_risk_model()
+
+
+def _wrap_xgb_as_boosted(xgb_model, feature_names: list[str] | None = None) -> BoostedRiskModel:
+    """
+    Create a minimal BoostedRiskModel-like adapter from a trained sklearn/xgboost
+    estimator that implements `predict_proba`. This keeps the rest of the code
+    compatible with the existing `BoostedRiskModel` interface.
+    """
+    # We create a single-stump passthrough that returns the model probability
+    class Wrapped:
+        def __init__(self, model):
+            self.model = model
+
+        def predict_row(self, row: np.ndarray) -> float:
+            X = row.reshape(1, -1)
+            proba = float(self.model.predict_proba(X)[0, 1])
+            return proba
+
+        def predict_batch(self, matrix: np.ndarray) -> np.ndarray:
+            mat = np.asarray(matrix, dtype=float)
+            if mat.ndim == 1:
+                mat = mat.reshape(1, -1)
+            return self.model.predict_proba(mat)[:, 1].astype(float)
+
+    # Create a dummy BoostedRiskModel wrapper using the Wrapped estimator
+    wrapper = Wrapped(xgb_model)
+
+    # Build a minimal BoostedRiskModel that proxies to wrapper
+    adapter = BoostedRiskModel(base_logit=0.0, learning_rate=1.0, stumps=[], feature_names=feature_names or [])
+
+    # Monkey-patch predict methods to call wrapped model
+    adapter.predict_row = wrapper.predict_row  # type: ignore
+    adapter.predict_batch = wrapper.predict_batch  # type: ignore
+    return adapter
+
+
+def train_xgboost_model(sample_count: int = 16384, seed: int = 7) -> str:
+    """Train a real XGBoost classifier on synthetic data and save as joblib.
+    Returns path to saved model or raises on failure.
+    """
+    if xgb is None or joblib is None:
+        raise RuntimeError("xgboost or joblib not installed")
+
+    features, targets, feature_names = generate_risk_dataset(sample_count=sample_count, seed=seed)
+
+    # Convert probabilistic targets to binary labels using 0.5 threshold for classifier
+    labels = (targets >= 0.5).astype(int)
+
+    clf = xgb.XGBClassifier(use_label_encoder=False, eval_metric="logloss", random_state=seed, n_estimators=200)
+    clf.fit(features, labels)
+
+    from .artifacts import artifact_path
+
+    out_path = artifact_path(RISK_ARTIFACT_JOBLIB)
+    joblib.dump(clf, out_path)
+    logger.info("Trained and saved XGBoost model to %s", out_path)
+    return str(out_path)
 
 
 class XGBoostScorer:
     """
-    Tabular risk scoring for conjunction events.
-    Features: miss_distance, relative_speed, combined_size, altitude, etc.
+    Tabular collision-risk scorer.
+    The implementation is a compact boosted-stump model trained on synthetic
+    conjunction data so the runtime stays lightweight and deterministic.
     """
 
     def __init__(self, model_path: str = None):
-        self.model = None
-        if model_path:
-            self._load_model(model_path)
+        self.model: BoostedRiskModel | None = None
+        self.model_path = model_path
+        self._load_or_train_model(model_path)
 
-    def _load_model(self, path: str):
-        """Load a trained XGBoost model from disk."""
+    def _load_or_train_model(self, path: str | None):
         try:
-            # import xgboost as xgb
-            # self.model = xgb.Booster()
-            # self.model.load_model(path)
-            logger.info(f"Model loaded from {path}")
-        except Exception as e:
-            logger.warning(f"Failed to load model: {e}")
+            if path:
+                payload = load_artifact(path)
+            else:
+                payload = load_artifact(RISK_ARTIFACT)
 
-    def extract_features(self, event: dict) -> list[float]:
+            if payload and "model" in payload:
+                self.model = BoostedRiskModel.from_dict(payload["model"])
+                logger.info("Risk model loaded from %s", path or RISK_ARTIFACT)
+                return
+
+            self.model = train_risk_model()
+        except Exception as error:
+            logger.warning("Risk model bootstrap failed, retraining: %s", error)
+            self.model = train_risk_model()
+
+    def extract_features(self, event: dict[str, Any]) -> list[float]:
         """
-        Extract feature vector from a conjunction event.
-        Expected event keys:
-            miss_distance_km, relative_speed_kmh,
-            sat1_altitude_km, sat2_altitude_km,
-            sat1_size_m, sat2_size_m
+        Extract the compact conjunction feature vector used by the scorer.
         """
         return [
-            event.get("miss_distance_km", 0.0),
-            event.get("relative_speed_kmh", 0.0),
-            event.get("sat1_altitude_km", 400.0),
-            event.get("sat2_altitude_km", 400.0),
-            event.get("sat1_size_m", 1.0),
-            event.get("sat2_size_m", 1.0),
+            float(event.get("miss_distance_km", 0.0)),
+            float(event.get("relative_speed_kmh", 0.0)),
+            float(event.get("sat1_altitude_km", 400.0)),
+            float(event.get("sat2_altitude_km", 400.0)),
+            float(event.get("tca_minutes", 0.0)),
+            float(event.get("sat1_size_m", 1.0)),
+            float(event.get("sat2_size_m", 1.0)),
+            float(event.get("uncertainty_km", 0.0)),
         ]
 
-    def score(self, features: dict) -> float:
+    def score(self, features: dict | list[float] | np.ndarray) -> float:
         """
         Score collision risk from 0.0 (safe) to 1.0 (critical).
-        Deterministic heuristic used until a trained model is plugged in.
         """
-        if self.model is not None:
-            # feat_vec = self.extract_features(features)
-            # import xgboost as xgb
-            # dmatrix = xgb.DMatrix([feat_vec])
-            # return float(self.model.predict(dmatrix)[0])
-            pass
+        if self.model is None:
+            self._load_or_train_model(self.model_path)
 
-        miss_dist = max(float(features.get("miss_distance_km", 100.0)), 0.0)
-        rel_speed = max(float(features.get("relative_speed_kmh", 0.0)), 0.0)
-        sat1_alt = max(float(features.get("sat1_altitude_km", 400.0)), 0.0)
-        sat2_alt = max(float(features.get("sat2_altitude_km", 400.0)), 0.0)
-        combined_alt = (sat1_alt + sat2_alt) / 2.0
+        if isinstance(features, dict):
+            row = np.asarray(self.extract_features(features), dtype=float)
+        else:
+            row = np.asarray(features, dtype=float)
 
-        tca_minutes = float(features.get("tca_minutes", 0.0))
-        if tca_minutes < 0.0:
-            tca_minutes = 0.0
+        if row.ndim != 1:
+            row = row.reshape(-1)
 
-        miss_component = max(0.0, 1.0 - (miss_dist / 500.0))
-        speed_component = min(rel_speed / 20000.0, 1.0)
-        tca_component = 1.0 / (1.0 + (tca_minutes / 60.0))
-        altitude_component = max(0.0, 1.0 - (combined_alt / 2000.0))
+        if self.model is None:
+            return 0.0
 
-        score = (
-            0.50 * miss_component
-            + 0.20 * speed_component
-            + 0.15 * tca_component
-            + 0.15 * altitude_component
-        )
-        return round(max(0.0, min(1.0, score)), 4)
+        return float(np.clip(self.model.predict_row(row), 0.0, 1.0))

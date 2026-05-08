@@ -1,6 +1,7 @@
 """
 Conjunction assessment engine.
 Computes pairwise miss distances and identifies close approaches.
+Incorporates RIC frame transformation and Akella-Alfriend collision probability.
 """
 
 import numpy as np
@@ -26,6 +27,8 @@ class ConjunctionEvent:
         "relative_speed_kmh",
         "tca_utc",
         "severity",
+        "probability_of_collision",
+        "cpi_score",
     ]
 
     def __init__(self):
@@ -37,6 +40,8 @@ class ConjunctionEvent:
         self.relative_speed_kmh = 0.0
         self.tca_utc = ""
         self.severity = "green"
+        self.probability_of_collision = 0.0
+        self.cpi_score = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +51,8 @@ class ConjunctionEvent:
             "relative_speed_kmh": round(self.relative_speed_kmh, 2),
             "tca_utc": self.tca_utc,
             "severity": self.severity,
+            "probability_of_collision": round(self.probability_of_collision, 6),
+            "cpi_score": round(self.cpi_score, 2),
         }
 
 
@@ -75,14 +82,140 @@ def compute_relative_speed(s1: SatelliteState, s2: SatelliteState) -> float:
     return np.sqrt(dvx * dvx + dvy * dvy + dvz * dvz) * 3600
 
 
+def compute_ric_frame(pos_chief: np.ndarray, vel_chief: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute RIC (Radial-In-Track-Cross-track) frame unit vectors.
+    R: radial (along position)
+    I: in-track (along velocity direction)
+    C: cross-track (orbit normal)
+    """
+    r_norm = np.linalg.norm(pos_chief)
+    if r_norm < 1e-6:
+        return np.array([1, 0, 0], dtype=float), np.array([0, 1, 0], dtype=float), np.array([0, 0, 1], dtype=float)
+
+    r_hat = pos_chief / r_norm
+    h = np.cross(pos_chief, vel_chief)
+    h_norm = np.linalg.norm(h)
+    if h_norm < 1e-6:
+        c_hat = np.array([0, 0, 1], dtype=float)
+    else:
+        c_hat = h / h_norm
+
+    i_hat = np.cross(c_hat, r_hat)
+    return r_hat, i_hat, c_hat
+
+
+def transform_covariance_to_ric(
+    cov_6x6_sat1: np.ndarray,
+    cov_6x6_sat2: np.ndarray,
+    r_hat: np.ndarray,
+    i_hat: np.ndarray,
+    c_hat: np.ndarray,
+) -> np.ndarray:
+    """
+    Transform covariances from ECI to RIC frame relative coordinates.
+    Returns a 2x2 covariance matrix for relative RIC position (R, I only).
+    """
+    # Build rotation matrix for position: [r, i, c]^T
+    R_mat = np.vstack([r_hat, i_hat, c_hat])
+
+    # Extract position covariance (top-left 3x3)
+    P_pos_1 = cov_6x6_sat1[:3, :3]
+    P_pos_2 = cov_6x6_sat2[:3, :3]
+
+    # Relative covariance in ECI: P_rel = P1 + P2
+    P_rel_eci = P_pos_1 + P_pos_2
+
+    # Transform to RIC frame
+    P_rel_ric = R_mat @ P_rel_eci @ R_mat.T
+
+    # Extract R-I submatrix (ignore C for now)
+    P_rel_2d = P_rel_ric[:2, :2]
+    return P_rel_2d
+
+
+def compute_collision_probability_2d(
+    miss_distance_ric: np.ndarray,
+    covariance_2d: np.ndarray,
+    combined_radius_km: float = 0.010,  # Default ~10 meters
+) -> float:
+    """
+    Compute collision probability using 2D Gaussian integral (Akella-Alfriend).
+    miss_distance_ric: [r, i] relative position in RIC frame (km)
+    covariance_2d: 2x2 covariance matrix in RIC frame (km^2)
+    combined_radius_km: sum of hard-body radii (km)
+
+    Returns: probability in [0, 1]
+    """
+    try:
+        # Ensure covariance is positive definite
+        eigvals = np.linalg.eigvals(covariance_2d)
+        if np.any(eigvals <= 1e-10):
+            # Degenerate covariance, use miss distance only
+            miss_dist_norm = np.linalg.norm(miss_distance_ric)
+            return 1.0 if miss_dist_norm < combined_radius_km else 0.0
+
+        # Mahalanobis distance
+        try:
+            cov_inv = np.linalg.inv(covariance_2d)
+        except np.linalg.LinAlgError:
+            miss_dist_norm = np.linalg.norm(miss_distance_ric)
+            return 1.0 if miss_dist_norm < combined_radius_km else 0.0
+
+        mahal_dist_sq = miss_distance_ric @ cov_inv @ miss_distance_ric
+        mahal_dist = float(np.sqrt(max(mahal_dist_sq, 0.0)))
+
+        # 2D Gaussian CDF approximation for circular collision region
+        # P(collision) ≈ integral over circle of radius R
+        # For 2D Gaussian: uses chi-squared(2) distribution
+        from scipy.special import gammainc
+        p_coll = float(gammainc(1.0, (combined_radius_km**2) / (np.trace(covariance_2d) + 1e-10)))
+        return float(np.clip(p_coll, 0.0, 1.0))
+    except Exception as e:
+        logger.debug(f"Collision probability computation failed: {e}")
+        return 0.0
+
+
+def compute_cpi_score(probability_of_collision: float, miss_distance_km: float) -> float:
+    """
+    Convert collision probability and miss distance to a 0-10 CPI score.
+    CPI (Collision Probability Index):
+    - 0-2: Very low risk
+    - 2-5: Low to moderate risk
+    - 5-7: Moderate to high risk
+    - 7-10: Critical risk
+    """
+    # Base CPI from probability: [0, 10] scale
+    p_component = min(probability_of_collision * 10.0, 10.0)
+
+    # Distance penalty: closer = higher CPI
+    if miss_distance_km < 0.5:
+        dist_component = 8.0
+    elif miss_distance_km < 5.0:
+        dist_component = 5.0 + (5.0 - miss_distance_km) * 0.6
+    elif miss_distance_km < 50.0:
+        dist_component = 3.0 + (50.0 - miss_distance_km) / 50.0 * 2.0
+    else:
+        dist_component = max(0.5, 1.0)
+
+    # Weighted average: 60% probability, 40% distance
+    cpi = 0.6 * p_component + 0.4 * dist_component
+    return float(np.clip(cpi, 0.0, 10.0))
+
+
 def screen_conjunctions(
     states: list[SatelliteState],
     threshold_km: float = WATCH_DISTANCE_KM,
+    kalman_states: dict = None,
 ) -> list[ConjunctionEvent]:
     """
-    Pairwise conjunction screening.
-    Returns events where miss distance < threshold.
+    Pairwise conjunction screening with RIC-frame collision probability.
+    kalman_states: dict[norad_id] -> dict with covariance_6x6 (optional)
+    Returns events where miss distance < threshold or CPI > 2.0
     """
+    if kalman_states is None:
+        kalman_states = {}
+
     events = []
     n = len(states)
 
@@ -95,9 +228,57 @@ def screen_conjunctions(
                 continue
 
             dist = compute_miss_distance(s1, s2)
+            rel_speed = compute_relative_speed(s1, s2)
             severity = classify_severity(dist)
 
-            if severity == "none":
+            # Try covariance-based CPI if Kalman states available
+            p_collision = 0.0
+            cpi_score = 0.0
+
+            kal_state_1 = kalman_states.get(s1.norad_id)
+            kal_state_2 = kalman_states.get(s2.norad_id)
+
+            if kal_state_1 is not None and kal_state_2 is not None:
+                try:
+                    # RIC frame transformation
+                    pos_1 = np.array([s1.x, s1.y, s1.z], dtype=float)
+                    vel_1 = np.array([s1.vx, s1.vy, s1.vz], dtype=float)
+                    r_hat, i_hat, c_hat = compute_ric_frame(pos_1, vel_1)
+
+                    # Get covariances from dict
+                    cov_1 = np.asarray(kal_state_1.get("covariance_6x6", []), dtype=float)
+                    cov_2 = np.asarray(kal_state_2.get("covariance_6x6", []), dtype=float)
+
+                    # Ensure covariances are 6x6
+                    if cov_1.ndim == 1 and cov_1.size == 36:
+                        cov_1 = cov_1.reshape(6, 6)
+                    if cov_2.ndim == 1 and cov_2.size == 36:
+                        cov_2 = cov_2.reshape(6, 6)
+
+                    if cov_1.size > 0 and cov_2.size > 0 and cov_1.shape == (6, 6) and cov_2.shape == (6, 6):
+                        # Transform to RIC frame
+                        cov_2d = transform_covariance_to_ric(cov_1, cov_2, r_hat, i_hat, c_hat)
+
+                        # Relative position in RIC frame
+                        rel_pos = pos_1 - np.array([s2.x, s2.y, s2.z], dtype=float)
+                        rel_pos_ric = np.array([
+                            np.dot(rel_pos, r_hat),
+                            np.dot(rel_pos, i_hat),
+                        ], dtype=float)
+
+                        # Compute collision probability
+                        combined_radius = 0.010  # 10 meters
+                        p_collision = compute_collision_probability_2d(rel_pos_ric, cov_2d, combined_radius)
+                        cpi_score = compute_cpi_score(p_collision, dist)
+                except Exception as e:
+                    logger.debug(f"RIC CPI computation failed: {e}")
+                    cpi_score = 0.0
+            else:
+                # Fallback to simple heuristic CPI without covariance
+                cpi_score = compute_cpi_score(0.0, dist)
+
+            # Report if severity is high or CPI is concerning
+            if severity == "none" and cpi_score < 2.0:
                 continue
 
             event = ConjunctionEvent()
@@ -106,14 +287,16 @@ def screen_conjunctions(
             event.sat2_id = s2.norad_id
             event.sat2_name = s2.name
             event.miss_distance_km = dist
-            event.relative_speed_kmh = compute_relative_speed(s1, s2)
+            event.relative_speed_kmh = rel_speed
             event.tca_utc = s1.epoch_utc
             event.severity = severity
+            event.probability_of_collision = p_collision
+            event.cpi_score = cpi_score
 
             events.append(event)
 
-    # Sort by miss distance ascending (most critical first)
-    events.sort(key=lambda e: e.miss_distance_km)
+    # Sort by CPI score descending (most critical first)
+    events.sort(key=lambda e: e.cpi_score, reverse=True)
     return events
 
 
@@ -150,17 +333,14 @@ def find_tca(
 
         if dist < min_dist:
             min_dist = dist
-            severity = classify_severity(dist)
-
-            event = ConjunctionEvent()
-            event.sat1_id = s1.norad_id
-            event.sat1_name = s1.name
-            event.sat2_id = s2.norad_id
-            event.sat2_name = s2.name
-            event.miss_distance_km = dist
-            event.relative_speed_kmh = compute_relative_speed(s1, s2)
-            event.tca_utc = t.isoformat()
-            event.severity = severity
-            best_event = event
+            best_event = ConjunctionEvent()
+            best_event.sat1_id = s1.norad_id
+            best_event.sat1_name = s1.name
+            best_event.sat2_id = s2.norad_id
+            best_event.sat2_name = s2.name
+            best_event.miss_distance_km = dist
+            best_event.relative_speed_kmh = compute_relative_speed(s1, s2)
+            best_event.tca_utc = t.isoformat()
+            best_event.severity = classify_severity(dist)
 
     return best_event

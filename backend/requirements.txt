@@ -6,3 +6,5 @@ filterpy
 python-dotenv
 httpx
 scipy
+joblib
+xgboost
