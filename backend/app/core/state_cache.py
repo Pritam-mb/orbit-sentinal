@@ -25,8 +25,16 @@ def set_latest_snapshot(snapshot: dict[str, Any]):
     _latest_snapshot = snapshot
 
 
+def update_snapshot(snapshot: dict[str, Any]):
+    set_latest_snapshot(snapshot)
+
+
 def get_latest_snapshot() -> dict[str, Any]:
     return _latest_snapshot
+
+
+def get_snapshot() -> dict[str, Any]:
+    return get_latest_snapshot()
 
 
 def set_latest_alerts(alerts_snapshot: dict[str, Any]):
@@ -34,5 +42,13 @@ def set_latest_alerts(alerts_snapshot: dict[str, Any]):
     _latest_alerts = alerts_snapshot
 
 
+def update_alerts(alerts_snapshot: dict[str, Any]):
+    set_latest_alerts(alerts_snapshot)
+
+
 def get_latest_alerts() -> dict[str, Any]:
     return _latest_alerts
+
+
+def get_alerts_snapshot() -> dict[str, Any]:
+    return get_latest_alerts()

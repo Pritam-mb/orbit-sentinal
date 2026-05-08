@@ -81,7 +81,12 @@ class SimEngine:
         logger.info("Scenario cleared")
 
     def apply_maneuver(
-        self, norad_id: int, dvx: float, dvy: float, dvz: float
+        self,
+        norad_id: int,
+        dvx: float,
+        dvy: float,
+        dvz: float,
+        frame: str = "RSW",
     ) -> dict:
         """
         Apply a delta-V impulse maneuver.
@@ -95,14 +100,11 @@ class SimEngine:
                 "preflight": preflight,
             }
 
-        self.propagator.apply_delta_v(norad_id, dvx, dvy, dvz)
+        result = self.propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame)
+        if result.get("status") != "success":
+            return {"status": "ERROR", "preflight": preflight, **result}
 
-        return {
-            "status": "EXECUTED",
-            "norad_id": norad_id,
-            "delta_v": {"dvx": dvx, "dvy": dvy, "dvz": dvz},
-            "preflight": preflight,
-        }
+        return {**result, "preflight": preflight}
 
     def preflight_check(
         self, norad_id: int, dvx: float, dvy: float, dvz: float

@@ -2,11 +2,13 @@
 REST API routes for maneuvers, scenarios, and alerts.
 """
 
+import asyncio
+import json
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
-from app.core.state_cache import get_latest_alerts, get_latest_snapshot
+from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_snapshot
 
 router = APIRouter(prefix="/api")
 
@@ -16,6 +18,7 @@ class ManeuverRequest(BaseModel):
     dvx: float  # m/s
     dvy: float
     dvz: float
+    frame: str = "RSW"
 
 
 class ScenarioRequest(BaseModel):
@@ -31,6 +34,39 @@ def init_routes(propagator, sim_engine):
     global _propagator, _sim_engine
     _propagator = propagator
     _sim_engine = sim_engine
+
+
+def _build_snapshot(current_propagator, dt: datetime) -> dict:
+    states = current_propagator.propagate_all(dt)
+
+    active_states = [state for state in states if state.error_code == 0]
+    satellites = [
+        {
+            "norad_id": state.norad_id,
+            "name": state.name,
+            "position": {
+                "x": state.x,
+                "y": state.y,
+                "z": state.z,
+            },
+        }
+        for state in active_states
+    ]
+
+    snapshot = {
+        "type": "update",
+        "timestamp": dt.isoformat(),
+        "satellites": satellites,
+        "count": len(states),
+        "states": active_states,
+    }
+    snapshot["payload"] = json.dumps({
+        "type": snapshot["type"],
+        "timestamp": snapshot["timestamp"],
+        "satellites": satellites,
+        "count": snapshot["count"],
+    }, separators=(",", ":"))
+    return snapshot
 
 
 @router.get("/satellites")
@@ -122,10 +158,25 @@ async def get_satellite_orbit(
 @router.post("/maneuver")
 async def execute_maneuver(req: ManeuverRequest):
     """Execute a delta-V maneuver with pre-flight validation."""
-    if _sim_engine is None:
+    if _sim_engine is None or _propagator is None:
         return {"status": "ERROR", "message": "Sim engine not initialized"}
 
-    result = _sim_engine.apply_maneuver(req.norad_id, req.dvx, req.dvy, req.dvz)
+    result = _sim_engine.apply_maneuver(
+        req.norad_id,
+        req.dvx,
+        req.dvy,
+        req.dvz,
+        frame=req.frame,
+    )
+
+    if result.get("status") == "success":
+        snapshot = await asyncio.to_thread(
+            _build_snapshot,
+            _propagator,
+            datetime.now(timezone.utc),
+        )
+        set_latest_snapshot(snapshot)
+
     return result
 
 
