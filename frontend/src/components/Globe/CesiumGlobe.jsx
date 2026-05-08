@@ -243,6 +243,19 @@ const CesiumGlobe = () => {
       : Date.now();
     const previousSnapshotTimestampMs = motionRef.current.lastSnapshotTimestampMs;
 
+    // IMPORTANT: Ignore duplicate updates from REST vs WS race conditions.
+    // If we process a duplicate timestamp, it resets our animation elapsed time to 0,
+    // violently ripping the satellite back to its starting block.
+    if (previousSnapshotTimestampMs != null) {
+      if (snapshotTimestampMs === previousSnapshotTimestampMs) {
+        return; // Ignore exact duplicates
+      }
+      // If timestamp went backwards (REST poll resolving after WS update), ignore it
+      if (snapshotTimestampMs < previousSnapshotTimestampMs && snapshotTimestampMs > previousSnapshotTimestampMs - 10000) {
+        return; 
+      }
+    }
+
     const previousSnapshotPositions = motionRef.current.snapshotPositions;
     const nextSnapshotPositions = new Map();
     const nextSnapshotVelocities = new Map();
@@ -579,10 +592,19 @@ const CesiumGlobe = () => {
       lastFramePerfMs = currentPerfMs;
 
       const { map, focusLabel } = primitivesRef.current;
-      if (map.size === 0) return;
+      const snapshotTimestampMs = motionRef.current.lastSnapshotTimestampMs;
+      const snapshotReceivedPerfMs = motionRef.current.lastSnapshotReceivedPerfMs;
 
-      const nowUtcMs = Date.now();
-      const gmst = computeGmst(new Date(nowUtcMs));
+      if (snapshotTimestampMs == null || map.size === 0) return;
+
+      // Elapsed physical time since this data explicitly touched our browser
+      const elapsedSeconds = Math.min(
+        Math.max((currentPerfMs - snapshotReceivedPerfMs) / 1000, 0),
+        SATELLITE_EXTRAPOLATION_LIMIT_SECONDS,
+      );
+
+      const frameDate = new Date(snapshotTimestampMs + (elapsedSeconds * 1000));
+      const gmst = computeGmst(frameDate);
       const cosG = Math.cos(gmst);
       const sinG = Math.sin(gmst);
       
@@ -590,18 +612,15 @@ const CesiumGlobe = () => {
       const focusedItem = hoveredSatelliteId != null ? map.get(hoveredSatelliteId) : null;
 
       for (const item of map.values()) {
-        if (!item.eciPosition || !item.snapshotEpochUtc) continue;
+        if (!item.eciPosition) continue;
 
         const velocity = item.eciVelocity || ZERO_VELOCITY;
         
-        // Exact physical position in space based purely on actual elapsed UTC time since the backend generated it
-        const epochMs = Date.parse(item.snapshotEpochUtc);
-        const actualElapsedSec = (nowUtcMs - epochMs) / 1000;
-        
+        // Target physical coordinate using pure local time extrapolation 
         const exactTargetEci = {
-          x: item.eciPosition.x + velocity.vx * actualElapsedSec,
-          y: item.eciPosition.y + velocity.vy * actualElapsedSec,
-          z: item.eciPosition.z + velocity.vz * actualElapsedSec,
+          x: item.eciPosition.x + velocity.vx * elapsedSeconds,
+          y: item.eciPosition.y + velocity.vy * elapsedSeconds,
+          z: item.eciPosition.z + velocity.vz * elapsedSeconds,
         };
 
         if (!item.renderedEci) {
