@@ -16,8 +16,8 @@ The frontend is a React + Cesium dashboard that renders a globe, shows live sate
 2. A background loop refreshes propagated satellite state every second.
 3. A slower background loop refreshes conjunction alerts from the latest cached states.
 4. The WebSocket broadcaster pushes the latest snapshot to connected clients at 1 Hz.
-5. `frontend/src/App.jsx` bootstraps the first snapshot and alert list through REST, then opens the WebSocket stream for live updates.
-6. `frontend/src/components/Globe/CesiumGlobe.jsx` renders satellites on the globe and keeps the scene in sync with the store.
+5. `frontend/src/App.jsx` bootstraps the first snapshot and alert list through REST, keeps a satellite polling fallback running, then opens the WebSocket stream for live updates.
+6. `frontend/src/components/Globe/CesiumGlobe.jsx` renders satellites on the globe and keeps the scene in sync with the store using live position and velocity data.
 7. `frontend/src/components/Telemetry/TelemetryPanel.jsx` fetches detailed state for the selected satellite and orbit track samples.
 8. `frontend/src/components/TestModePanel.jsx` configures deterministic two-satellite scenarios for the test workflow.
 9. `frontend/src/components/Control/ManualControl.jsx` and `frontend/src/components/Control/PreflightModal.jsx` handle the maneuver demo flow.
@@ -187,7 +187,11 @@ hackolution/
 
 - `backend/app/ml/xgboost_scorer.py` is a placeholder risk scorer.
   - `extract_features()` converts a conjunction event into a small numeric feature vector.
-  - `score()` currently produces a mocked risk value that increases as miss distance decreases.
+  - `score()` now returns a deterministic collision-risk heuristic that feeds CPI and cascade ranking.
+
+- `backend/app/ml/gnn_cascade.py` provides a deterministic graph-ranking layer for cascade planning.
+  - It scores each satellite by graph influence and local risk.
+  - It outputs maneuver probability and cascade depth estimates without requiring a heavyweight GNN runtime.
 
 #### Test and Service Layer
 
@@ -216,6 +220,11 @@ hackolution/
   - `preflight_check()` implements the six-gate demo validation logic.
   - `list_scenarios()` lists the JSON scenarios available in the folder.
 
+- `backend/app/services/cascade_planner.py` builds the constellation graph, ranks CPI risk, and produces a cascade maneuver plan.
+  - It uses KD-tree pruning to find influence neighbors efficiently.
+  - It scores each edge with a deterministic CPI heuristic and a graph-style ranker.
+  - It returns a maneuver chain, agencies involved, and a graph summary for the dashboard.
+
 - `backend/app/simulation/approaching.json` is a deterministic demo scenario with two satellites and an expected close approach.
 - `backend/app/simulation/tle-data.txt` is the bundled local TLE snapshot used for startup and fallback loading.
 
@@ -232,6 +241,7 @@ hackolution/
 
 - `frontend/src/App.jsx` is the top-level UI container.
   - It boots the initial satellite and alert data with REST calls.
+  - It polls satellites as a fallback so the globe keeps animating even if the WebSocket stalls.
   - It opens the satellite WebSocket and reconnects if the socket closes.
   - It keeps the main store in sync with snapshot timestamps, satellites, alerts, and connection state.
   - It renders the globe panel on the left and the control/sidebar stack on the right.
@@ -269,6 +279,7 @@ hackolution/
   - It creates a Cesium viewer without the default UI chrome.
   - It uses `frontend/public/earth-realistic-8k.webp` as the globe texture.
   - It renders satellites as billboards, labels the hovered object, and draws the selected orbit track.
+  - It uses backend-provided velocity where available so satellites keep moving smoothly between updates.
   - It highlights the selected satellite, hovered satellite, and test-mode satellites with different colors and scales.
   - It also draws a line between the two override satellites when test mode is active.
   - It uses `VITE_CESIUM_TOKEN` if a Cesium Ion token is provided in the environment.
@@ -305,8 +316,9 @@ hackolution/
   - It disables burn confirmation until all gates pass.
 
 - `frontend/src/components/Alert/AlertPanel.jsx` is a reusable conjunction-alert list component.
-  - It reads alert data from the store and renders a compact list of pairwise alerts.
-  - It is present in the codebase but is not currently mounted in `App.jsx`.
+  - It reads alert data and the cascade plan from the store and renders a compact list of pairwise alerts.
+  - It also shows the cascade summary, total delta-v, and maneuver chain.
+  - It is mounted in the sidebar in `App.jsx`.
 
 ### Static Assets
 

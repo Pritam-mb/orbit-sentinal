@@ -8,6 +8,8 @@ const ManualControl = () => {
   const maneuver = useStore((s) => s.maneuver);
   const setManeuver = useStore((s) => s.setManeuver);
   const resetManeuver = useStore((s) => s.resetManeuver);
+  const setAlerts = useStore((s) => s.setAlerts);
+  const setCascadePlan = useStore((s) => s.setCascadePlan);
   const selectedSatelliteId = useStore((s) => s.selectedSatelliteId);
   const selectedSatellite = useStore((s) => {
     if (!s.selectedSatelliteId) return null;
@@ -46,6 +48,22 @@ const ManualControl = () => {
         }),
       });
       const data = await resp.json();
+      if (data?.alerts) {
+        setAlerts(data.alerts || []);
+      }
+      if (Object.prototype.hasOwnProperty.call(data, 'cascade_plan')) {
+        setCascadePlan({
+          graph: data.graph || {},
+          alerts: data.alerts || [],
+          cascade_plan: data.cascade_plan || [],
+          total_delta_v_ms: data.total_delta_v_ms || 0,
+          cascade_depth: data.cascade_depth || 0,
+          agencies_involved: data.agencies_involved || [],
+          seed_satellites: data.seed_satellites || [],
+          cpi_threshold: data.cpi_threshold || 5,
+          node_probabilities: data.node_probabilities || {},
+        });
+      }
       setResult(data);
     } catch (e) {
       setResult({ status: 'ERROR', error: e.message });

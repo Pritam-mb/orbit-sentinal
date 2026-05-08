@@ -21,6 +21,7 @@ from app.core.state_cache import (
 )
 from app.data.tle_fetcher import load_local_tles
 from app.simulation.sim_engine import SimEngine
+from app.services.cascade_planner import CascadePlanner
 from app.api.ws_handler import ConnectionManager, satellite_broadcast_loop
 from app.api.routes import router, init_routes
 from app.routers.test_mode import router as test_mode_router, init_test_mode
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 propagator = SGP4Propagator()
 sim_engine = SimEngine(propagator)
 ws_manager = ConnectionManager()
+cascade_planner = CascadePlanner()
 
 
 def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
@@ -50,6 +52,14 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
                 "y": state.y,
                 "z": state.z,
             },
+            "velocity": {
+                "vx": state.vx,
+                "vy": state.vy,
+                "vz": state.vz,
+            },
+            "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
+            "altitude_km": round(float(((state.x**2 + state.y**2 + state.z**2) ** 0.5) - 6371.0), 2),
+            "epoch_utc": state.epoch_utc,
         }
         for state in active_states
     ]
@@ -93,6 +103,17 @@ async def refresh_alerts_loop():
             snapshot = get_latest_snapshot()
             states = snapshot.get("states", [])
             alerts = []
+            cascade_summary = {
+                "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
+                "alerts": [],
+                "cascade_plan": [],
+                "total_delta_v_ms": 0.0,
+                "cascade_depth": 0,
+                "agencies_involved": [],
+                "seed_satellites": [],
+                "cpi_threshold": 5.0,
+                "node_probabilities": {},
+            }
 
             if states:
                 if len(states) > max_alert_states:
@@ -102,11 +123,24 @@ async def refresh_alerts_loop():
                     sampled_states = states
 
                 alerts = await asyncio.to_thread(screen_conjunctions, sampled_states)
+                cascade_summary = await asyncio.to_thread(
+                    cascade_planner.analyze_snapshot,
+                    sampled_states,
+                    [alert.to_dict() for alert in alerts],
+                )
 
             set_latest_alerts({
                 "timestamp": snapshot.get("timestamp"),
-                "alerts": [a.to_dict() for a in alerts],
+                "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
                 "count": len(alerts),
+                "graph": cascade_summary.get("graph", {}),
+                "cascade_plan": cascade_summary.get("cascade_plan", []),
+                "cascade_depth": cascade_summary.get("cascade_depth", 0),
+                "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
+                "agencies_involved": cascade_summary.get("agencies_involved", []),
+                "seed_satellites": cascade_summary.get("seed_satellites", []),
+                "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
+                "node_probabilities": cascade_summary.get("node_probabilities", {}),
             })
         except asyncio.CancelledError:
             raise

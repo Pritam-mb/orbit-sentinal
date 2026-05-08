@@ -17,6 +17,11 @@ _latest_alerts: dict[str, Any] = {
     "timestamp": None,
     "alerts": [],
     "count": 0,
+    "cascade_plan": [],
+    "graph": {},
+    "cascade_depth": 0,
+    "total_delta_v_ms": 0.0,
+    "agencies_involved": [],
 }
 
 

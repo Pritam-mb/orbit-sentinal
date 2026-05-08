@@ -17,7 +17,7 @@ const SATELLITE_SCALE_BY_DISTANCE = new Cesium.NearFarScalar(
   30000000.0,
   0.2,
 );
-const SATELLITE_EXTRAPOLATION_LIMIT_SECONDS = 1.5;
+const SATELLITE_EXTRAPOLATION_LIMIT_SECONDS = 10.0;
 const ORBIT_BREAK_DISTANCE_KM = 8000;
 const ZERO_VELOCITY = { vx: 0, vy: 0, vz: 0 };
 
@@ -239,6 +239,7 @@ const CesiumGlobe = () => {
     const previousSnapshotTimestampMs = motionRef.current.lastSnapshotTimestampMs;
     const previousSnapshotPositions = motionRef.current.snapshotPositions;
     const nextSnapshotPositions = new Map();
+    const nextSnapshotVelocities = new Map();
     const existingIds = new Set();
     const focusedSatelliteId = useStore.getState().hoveredSatelliteId;
     const defaultColor = Cesium.Color.WHITE.withAlpha(0.55);
@@ -251,19 +252,28 @@ const CesiumGlobe = () => {
       nextSnapshotPositions.set(sat.norad_id, sat.position);
 
       const previousPosition = previousSnapshotPositions.get(sat.norad_id);
-      const velocity = previousPosition
+      const snapshotVelocity = sat.velocity
+        ? {
+            vx: sat.velocity.vx || 0,
+            vy: sat.velocity.vy || 0,
+            vz: sat.velocity.vz || 0,
+          }
+        : null;
+      const derivedVelocity = previousPosition
         ? {
             vx: (sat.position.x - previousPosition.x) / deltaSeconds,
             vy: (sat.position.y - previousPosition.y) / deltaSeconds,
             vz: (sat.position.z - previousPosition.z) / deltaSeconds,
           }
         : ZERO_VELOCITY;
+      const velocity = snapshotVelocity || derivedVelocity;
 
       let item = map.get(sat.norad_id);
       if (item) {
         item.name = sat.name;
         item.eciPosition = sat.position;
         item.eciVelocity = velocity;
+        item.snapshotEpochUtc = sat.epoch_utc || null;
       } else {
         const billboard = billboards.add({
           position: new Cesium.Cartesian3(),
@@ -279,9 +289,12 @@ const CesiumGlobe = () => {
           name: sat.name,
           eciPosition: sat.position,
           eciVelocity: velocity,
+          snapshotEpochUtc: sat.epoch_utc || null,
         };
         map.set(sat.norad_id, item);
       }
+
+      nextSnapshotVelocities.set(sat.norad_id, velocity);
     }
 
     // Remove entities no longer in the satellite list
@@ -293,6 +306,7 @@ const CesiumGlobe = () => {
     }
 
     motionRef.current.snapshotPositions = nextSnapshotPositions;
+    motionRef.current.snapshotVelocities = nextSnapshotVelocities;
     motionRef.current.lastSnapshotTimestampMs = snapshotTimestampMs;
     motionRef.current.lastSnapshotReceivedPerfMs = performance.now();
 
