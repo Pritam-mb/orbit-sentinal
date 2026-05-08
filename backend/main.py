@@ -18,6 +18,7 @@ from app.core.state_cache import (
     get_latest_snapshot,
     set_latest_alerts,
     set_latest_snapshot,
+    get_all_kalman_states,
 )
 from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
@@ -40,6 +41,8 @@ cascade_planner = CascadePlanner()
 
 def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
     """Compute a serializable snapshot for the latest satellite state."""
+    from app.core.state_cache import set_kalman_state
+    
     states = current_propagator.propagate_all(dt)
 
     active_states = [state for state in states if state.error_code == 0]
@@ -64,12 +67,22 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
         for state in active_states
     ]
 
+    # Capture Kalman covariance per satellite
+    covariances = {}
+    for state in active_states:
+        kal_state = current_propagator._kalman_states.get(state.norad_id)
+        if kal_state is not None:
+            kal_dict = kal_state.to_dict()
+            covariances[state.norad_id] = kal_dict.get("covariance_6x6")
+            set_kalman_state(state.norad_id, kal_dict)
+
     snapshot = {
         "type": "update",
         "timestamp": dt.isoformat(),
         "satellites": satellites,
         "count": len(states),
         "states": active_states,
+        "covariances": covariances,
     }
     snapshot["payload"] = json.dumps({
         "type": snapshot["type"],
@@ -122,7 +135,8 @@ async def refresh_alerts_loop():
                 else:
                     sampled_states = states
 
-                alerts = await asyncio.to_thread(screen_conjunctions, sampled_states)
+                kalman_states = get_all_kalman_states()
+                alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
                 cascade_summary = await asyncio.to_thread(
                     cascade_planner.analyze_snapshot,
                     sampled_states,

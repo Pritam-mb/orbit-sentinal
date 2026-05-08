@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
-from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot
+from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot, get_all_kalman_states
 from app.core.conjunction import screen_conjunctions
 from app.services.cascade_planner import CascadePlanner
 
@@ -25,6 +25,13 @@ class ManeuverRequest(BaseModel):
 
 class ScenarioRequest(BaseModel):
     name: str
+
+
+class JudgeManipulateRequest(BaseModel):
+    """Override a satellite's state and predict downstream effects."""
+    norad_id: int
+    position_eci_km: list[float] | None = None  # [x, y, z] in km
+    velocity_eci_kms: list[float] | None = None  # [vx, vy, vz] in km/s
 
 
 # These will be set by main.py on startup
@@ -216,7 +223,8 @@ async def execute_maneuver(req: ManeuverRequest):
                 step = max(1, len(sampled_states) // 250)
                 sampled_states = sampled_states[::step][:250]
 
-            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states)
+            kalman_states = get_all_kalman_states()
+            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
             cascade_summary = await asyncio.to_thread(
                 _cascade_planner.analyze_snapshot,
                 sampled_states,
@@ -294,3 +302,162 @@ async def preflight_check(req: ManeuverRequest):
 
     result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz, frame=req.frame)
     return result
+
+
+@router.post("/judge/manipulate-satellite")
+async def judge_manipulate_satellite(req: JudgeManipulateRequest):
+    """
+    Judge manipulation mode: override a satellite's state and immediately predict
+    downstream effects, neighbor risks, and cascade implications.
+    Returns: overridden state, KD-tree neighbors within 200km, CPI scores, and alerts.
+    """
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    now = datetime.now(timezone.utc)
+    
+    # Build base snapshot from current constellation
+    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, now)
+    states = snapshot.get("states", [])
+    
+    # Find and override the target satellite
+    target_idx = None
+    target_state = None
+    for idx, state in enumerate(states):
+        if state.norad_id == req.norad_id:
+            target_idx = idx
+            target_state = state
+            break
+    
+    if target_state is None:
+        raise HTTPException(status_code=404, detail=f"Satellite {req.norad_id} not found")
+    
+    # Apply override if provided
+    if req.position_eci_km is not None and len(req.position_eci_km) == 3:
+        target_state.x, target_state.y, target_state.z = req.position_eci_km
+    
+    if req.velocity_eci_kms is not None and len(req.velocity_eci_kms) == 3:
+        target_state.vx, target_state.vy, target_state.vz = req.velocity_eci_kms
+    
+    # Rebuild satellite list with override
+    satellites = [
+        {
+            "norad_id": state.norad_id,
+            "name": state.name,
+            "position": {
+                "x": state.x,
+                "y": state.y,
+                "z": state.z,
+            },
+            "velocity": {
+                "vx": state.vx,
+                "vy": state.vy,
+                "vz": state.vz,
+            },
+            "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
+            "altitude_km": round(float(((state.x**2 + state.y**2 + state.z**2) ** 0.5) - 6371.0), 2),
+            "epoch_utc": state.epoch_utc,
+        }
+        for state in states
+    ]
+    
+    # Recompute alerts and cascade plan with the overridden state
+    alerts = []
+    cascade_summary = {
+        "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
+        "alerts": [],
+        "cascade_plan": [],
+        "total_delta_v_ms": 0.0,
+        "cascade_depth": 0,
+        "agencies_involved": [],
+        "seed_satellites": [],
+        "cpi_threshold": 5.0,
+        "node_probabilities": {},
+    }
+    
+    if states:
+        if len(states) > 250:
+            step = max(1, len(states) // 250)
+            sampled_states = states[::step][:250]
+        else:
+            sampled_states = states
+        
+        kalman_states = get_all_kalman_states()
+        alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
+        cascade_summary = await asyncio.to_thread(
+            _cascade_planner.analyze_snapshot,
+            sampled_states,
+            [alert.to_dict() for alert in alerts],
+        )
+    
+    # Build a neighbor map: all satellites within 200 km of the target
+    target_pos = [target_state.x, target_state.y, target_state.z]
+    neighbors = []
+    
+    for state in states:
+        if state.norad_id == req.norad_id:
+            continue
+        
+        other_pos = [state.x, state.y, state.z]
+        distance_km = ((other_pos[0] - target_pos[0])**2 + 
+                       (other_pos[1] - target_pos[1])**2 + 
+                       (other_pos[2] - target_pos[2])**2) ** 0.5
+        
+        if distance_km <= 200.0:
+            # Find CPI score for this pair in the alerts
+            cpi_score = 0.0
+            for alert in cascade_summary.get("alerts", []):
+                if ((alert["sat1"]["id"] == req.norad_id and alert["sat2"]["id"] == state.norad_id) or
+                    (alert["sat1"]["id"] == state.norad_id and alert["sat2"]["id"] == req.norad_id)):
+                    cpi_score = alert.get("cpi_score", 0.0)
+                    break
+            
+            neighbors.append({
+                "satellite_id": state.norad_id,
+                "satellite_name": state.name,
+                "distance_km": round(distance_km, 3),
+                "position": {
+                    "x": state.x,
+                    "y": state.y,
+                    "z": state.z,
+                },
+                "velocity": {
+                    "vx": state.vx,
+                    "vy": state.vy,
+                    "vz": state.vz,
+                },
+                "speed_kmh": round(float((state.vx**2 + state.vy**2 + state.vz**2) ** 0.5 * 3600.0), 2),
+                "cpi_score": round(cpi_score, 2),
+                "collision_risk": "high" if cpi_score >= 7.0 else "medium" if cpi_score >= 5.0 else "low",
+            })
+    
+    # Sort neighbors by distance
+    neighbors.sort(key=lambda n: n["distance_km"])
+    
+    return {
+        "status": "success",
+        "manipulated_satellite": {
+            "norad_id": req.norad_id,
+            "name": target_state.name,
+            "position": {
+                "x": target_state.x,
+                "y": target_state.y,
+                "z": target_state.z,
+            },
+            "velocity": {
+                "vx": target_state.vx,
+                "vy": target_state.vy,
+                "vz": target_state.vz,
+            },
+            "speed_kmh": round(float((target_state.vx**2 + target_state.vy**2 + target_state.vz**2) ** 0.5 * 3600.0), 2),
+            "altitude_km": round(float(((target_state.x**2 + target_state.y**2 + target_state.z**2) ** 0.5) - 6371.0), 2),
+        },
+        "neighbors_within_200km": neighbors,
+        "neighbor_count": len(neighbors),
+        "alerts": cascade_summary.get("alerts", []),
+        "cascade_plan": cascade_summary.get("cascade_plan", []),
+        "graph": cascade_summary.get("graph", {}),
+        "cascade_depth": cascade_summary.get("cascade_depth", 0),
+        "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
+        "agencies_involved": cascade_summary.get("agencies_involved", []),
+    }

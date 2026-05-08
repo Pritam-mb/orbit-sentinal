@@ -11,7 +11,7 @@ from sgp4.api import Satrec, WGS72
 from sgp4.api import jday
 import numpy as np
 import logging
-
+from app.core.kalman import KalmanFilter, KalmanStateECI
 logger = logging.getLogger(__name__)
 
 MU = 398600.4418  # km^3/s^2
@@ -175,11 +175,14 @@ class SatelliteState:
 
 
 class SGP4Propagator:
-    """Batch SGP4 propagator for multiple satellites."""
+    """Batch SGP4 propagator for multiple satellites with Kalman covariance tracking."""
 
     def __init__(self):
         self._satellites: dict[int, tuple[Satrec, str]] = {}
         self._maneuvers: dict[int, tuple[float, float, float]] = {}
+        self._kalman_states: dict[int, KalmanStateECI] = {}  # Per-satellite Kalman state
+        self._kalman = KalmanFilter()
+        self._last_epoch: dict[int, datetime] = {}  # Track epoch for covariance propagation
         self._lock = RLock()
 
     def load_tles(self, tle_list: list[dict]):
@@ -190,6 +193,8 @@ class SGP4Propagator:
         with self._lock:
             self._satellites.clear()
             self._maneuvers.clear()
+            self._kalman_states.clear()
+            self._last_epoch.clear()
             for tle in tle_list:
                 try:
                     sat = Satrec.twoline2rv(tle["line1"], tle["line2"], WGS72)
@@ -238,7 +243,7 @@ class SGP4Propagator:
     def propagate_one(
         self, norad_id: int, dt: datetime = None
     ) -> SatelliteState | None:
-        """Propagate a single satellite."""
+        """Propagate a single satellite and update Kalman covariance."""
         with self._lock:
             if norad_id not in self._satellites:
                 return None
@@ -262,6 +267,30 @@ class SGP4Propagator:
         if e == 0:
             state.x, state.y, state.z = r
             state.vx, state.vy, state.vz = v
+
+            # Update Kalman state with SGP4 observation
+            with self._lock:
+                if norad_id not in self._kalman_states:
+                    # Initialize Kalman state on first propagation
+                    self._kalman_states[norad_id] = KalmanStateECI(
+                        position_km=[r[0], r[1], r[2]],
+                        velocity_kms=[v[0], v[1], v[2]],
+                        epoch_utc=dt.isoformat(),
+                    )
+                    self._last_epoch[norad_id] = dt
+                else:
+                    # Propagate covariance forward in time
+                    last_dt = self._last_epoch[norad_id]
+                    dt_seconds = (dt - last_dt).total_seconds()
+                    kal_state = self._kalman_states[norad_id]
+                    kal_state = self._kalman.propagate_covariance(kal_state, dt_seconds)
+                    # Update with new observation from SGP4
+                    kal_state = self._kalman.update_with_observation(
+                        kal_state,
+                        np.array([r[0], r[1], r[2]], dtype=float),
+                    )
+                    self._kalman_states[norad_id] = kal_state
+                    self._last_epoch[norad_id] = dt
 
         return state
 
