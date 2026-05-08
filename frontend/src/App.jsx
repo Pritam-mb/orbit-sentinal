@@ -146,9 +146,13 @@ function App() {
           <div className="header-meta">
             {satellites.length} OBJECTS TRACKED
           </div>
-          <div className={`header-test ${testActive ? 'active' : ''}`}>
+          <button 
+            type="button" 
+            className={`header-test ${testActive ? 'active' : ''}`}
+            onClick={() => useTestMode.getState().setTestActive(!testActive)}
+          >
             TEST MODE: {testActive ? 'ON' : 'OFF'}
-          </div>
+          </button>
         </div>
       </header>
 
