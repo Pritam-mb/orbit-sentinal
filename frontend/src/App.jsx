@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import CesiumGlobe from './components/Globe/CesiumGlobe';
 import TelemetryPanel from './components/Telemetry/TelemetryPanel';
 import ConjunctionMonitor from './components/ConjunctionMonitor';
+import AlertPanel from './components/Alert/AlertPanel';
 import ManualControl from './components/Control/ManualControl';
 import TestModePanel from './components/TestModePanel';
 import useStore from './store/useStore';
@@ -14,6 +15,7 @@ function App() {
   const setSatellites = useStore((s) => s.setSatellites);
   const setSnapshotTimestamp = useStore((s) => s.setSnapshotTimestamp);
   const setAlerts = useStore((s) => s.setAlerts);
+  const setCascadePlan = useStore((s) => s.setCascadePlan);
   const setWsConnected = useStore((s) => s.setWsConnected);
   const wsConnected = useStore((s) => s.wsConnected);
   const satellites = useStore((s) => s.satellites);
@@ -47,6 +49,7 @@ function App() {
         const alertData = await alertResponse.json();
         if (!cancelled) {
           setAlerts(alertData.alerts || []);
+          setCascadePlan(alertData.cascade_plan || null);
         }
       } catch (error) {
         console.error('Initial alert bootstrap failed:', error);
@@ -120,7 +123,7 @@ function App() {
         wsRef.current.close();
       }
     };
-  }, [setSatellites, setSnapshotTimestamp, setAlerts, setWsConnected]);
+  }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setWsConnected]);
 
   return (
     <div className="app-container">
@@ -156,6 +159,7 @@ function App() {
         <div className="sidebar">
           <TestModePanel />
           <ConjunctionMonitor />
+          <AlertPanel />
           <ManualControl />
         </div>
       </main>

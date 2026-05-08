@@ -8,7 +8,9 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
-from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_snapshot
+from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot
+from app.core.conjunction import screen_conjunctions
+from app.services.cascade_planner import CascadePlanner
 
 router = APIRouter(prefix="/api")
 
@@ -28,6 +30,7 @@ class ScenarioRequest(BaseModel):
 # These will be set by main.py on startup
 _propagator = None
 _sim_engine = None
+_cascade_planner = CascadePlanner()
 
 
 def init_routes(propagator, sim_engine):
@@ -114,6 +117,14 @@ async def get_alerts():
         "alerts": alerts_snapshot.get("alerts", []),
         "count": alerts_snapshot.get("count", 0),
         "timestamp": alerts_snapshot.get("timestamp"),
+        "cascade_plan": alerts_snapshot.get("cascade_plan", []),
+        "graph": alerts_snapshot.get("graph", {}),
+        "cascade_depth": alerts_snapshot.get("cascade_depth", 0),
+        "total_delta_v_ms": alerts_snapshot.get("total_delta_v_ms", 0.0),
+        "agencies_involved": alerts_snapshot.get("agencies_involved", []),
+        "seed_satellites": alerts_snapshot.get("seed_satellites", []),
+        "cpi_threshold": alerts_snapshot.get("cpi_threshold", 5.0),
+        "node_probabilities": alerts_snapshot.get("node_probabilities", {}),
     }
 
 
@@ -184,6 +195,59 @@ async def execute_maneuver(req: ManeuverRequest):
             datetime.now(timezone.utc),
         )
         set_latest_snapshot(snapshot)
+
+        sampled_states = snapshot.get("states", [])
+        alerts = []
+        cascade_summary = {
+            "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
+            "alerts": [],
+            "cascade_plan": [],
+            "total_delta_v_ms": 0.0,
+            "cascade_depth": 0,
+            "agencies_involved": [],
+            "seed_satellites": [],
+            "cpi_threshold": 5.0,
+            "node_probabilities": {},
+        }
+
+        if sampled_states:
+            if len(sampled_states) > 250:
+                step = max(1, len(sampled_states) // 250)
+                sampled_states = sampled_states[::step][:250]
+
+            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states)
+            cascade_summary = await asyncio.to_thread(
+                _cascade_planner.analyze_snapshot,
+                sampled_states,
+                [alert.to_dict() for alert in alerts],
+            )
+
+        result = {
+            **result,
+            "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
+            "cascade_plan": cascade_summary.get("cascade_plan", []),
+            "graph": cascade_summary.get("graph", {}),
+            "cascade_depth": cascade_summary.get("cascade_depth", 0),
+            "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
+            "agencies_involved": cascade_summary.get("agencies_involved", []),
+            "seed_satellites": cascade_summary.get("seed_satellites", []),
+            "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
+            "node_probabilities": cascade_summary.get("node_probabilities", {}),
+        }
+
+        set_latest_alerts({
+            "timestamp": snapshot.get("timestamp"),
+            "alerts": result["alerts"],
+            "count": len(result["alerts"]),
+            "graph": result["graph"],
+            "cascade_plan": result["cascade_plan"],
+            "cascade_depth": result["cascade_depth"],
+            "total_delta_v_ms": result["total_delta_v_ms"],
+            "agencies_involved": result["agencies_involved"],
+            "seed_satellites": result["seed_satellites"],
+            "cpi_threshold": result["cpi_threshold"],
+            "node_probabilities": result["node_probabilities"],
+        })
 
     return result
 

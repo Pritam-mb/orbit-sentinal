@@ -187,7 +187,11 @@ hackolution/
 
 - `backend/app/ml/xgboost_scorer.py` is a placeholder risk scorer.
   - `extract_features()` converts a conjunction event into a small numeric feature vector.
-  - `score()` currently produces a mocked risk value that increases as miss distance decreases.
+  - `score()` now returns a deterministic collision-risk heuristic that feeds CPI and cascade ranking.
+
+- `backend/app/ml/gnn_cascade.py` provides a deterministic graph-ranking layer for cascade planning.
+  - It scores each satellite by graph influence and local risk.
+  - It outputs maneuver probability and cascade depth estimates without requiring a heavyweight GNN runtime.
 
 #### Test and Service Layer
 
@@ -215,6 +219,11 @@ hackolution/
   - `apply_maneuver()` runs a preflight check and forwards the burn to the propagator so the updated orbit is immediately available.
   - `preflight_check()` implements the six-gate demo validation logic.
   - `list_scenarios()` lists the JSON scenarios available in the folder.
+
+- `backend/app/services/cascade_planner.py` builds the constellation graph, ranks CPI risk, and produces a cascade maneuver plan.
+  - It uses KD-tree pruning to find influence neighbors efficiently.
+  - It scores each edge with a deterministic CPI heuristic and a graph-style ranker.
+  - It returns a maneuver chain, agencies involved, and a graph summary for the dashboard.
 
 - `backend/app/simulation/approaching.json` is a deterministic demo scenario with two satellites and an expected close approach.
 - `backend/app/simulation/tle-data.txt` is the bundled local TLE snapshot used for startup and fallback loading.
@@ -307,8 +316,9 @@ hackolution/
   - It disables burn confirmation until all gates pass.
 
 - `frontend/src/components/Alert/AlertPanel.jsx` is a reusable conjunction-alert list component.
-  - It reads alert data from the store and renders a compact list of pairwise alerts.
-  - It is present in the codebase but is not currently mounted in `App.jsx`.
+  - It reads alert data and the cascade plan from the store and renders a compact list of pairwise alerts.
+  - It also shows the cascade summary, total delta-v, and maneuver chain.
+  - It is mounted in the sidebar in `App.jsx`.
 
 ### Static Assets
 
