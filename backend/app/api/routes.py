@@ -124,6 +124,7 @@ async def get_alerts():
         "alerts": alerts_snapshot.get("alerts", []),
         "count": alerts_snapshot.get("count", 0),
         "timestamp": alerts_snapshot.get("timestamp"),
+        "hotspots": alerts_snapshot.get("hotspots", []),
         "cascade_plan": alerts_snapshot.get("cascade_plan", []),
         "graph": alerts_snapshot.get("graph", {}),
         "cascade_depth": alerts_snapshot.get("cascade_depth", 0),
@@ -228,11 +229,14 @@ async def execute_maneuver(req: ManeuverRequest):
                 _cascade_planner.analyze_snapshot,
                 sampled_states,
                 [alert.to_dict() for alert in alerts],
+                _propagator,
+                datetime.fromisoformat(snapshot["timestamp"]),
             )
 
         result = {
             **result,
             "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
+                "hotspots": cascade_summary.get("hotspots", []),
             "cascade_plan": cascade_summary.get("cascade_plan", []),
             "graph": cascade_summary.get("graph", {}),
             "cascade_depth": cascade_summary.get("cascade_depth", 0),
@@ -247,6 +251,7 @@ async def execute_maneuver(req: ManeuverRequest):
             "timestamp": snapshot.get("timestamp"),
             "alerts": result["alerts"],
             "count": len(result["alerts"]),
+            "hotspots": result["hotspots"],
             "graph": result["graph"],
             "cascade_plan": result["cascade_plan"],
             "cascade_depth": result["cascade_depth"],
@@ -295,7 +300,7 @@ async def preflight_check(req: ManeuverRequest):
     if _sim_engine is None:
         return {"status": "ERROR"}
 
-    result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz)
+    result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz, frame=req.frame)
     return result
 
 

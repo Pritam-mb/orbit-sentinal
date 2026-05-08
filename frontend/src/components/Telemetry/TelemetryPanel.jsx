@@ -130,8 +130,8 @@ const TelemetryPanel = () => {
     );
   }
 
-  const now = new Date();
-  const lla = eciToLla(sat.position, now);
+  const epoch = sat.epoch_utc ? new Date(sat.epoch_utc) : new Date();
+  const lla = eciToLla(sat.position, epoch);
   const speedText = sat.speed_kmh != null ? Number(sat.speed_kmh).toLocaleString() : '---';
   const heightText = sat.altitude_km != null ? Math.round(Number(sat.altitude_km)).toLocaleString() : '---';
   const latitudeText = lla.lat != null ? lla.lat.toFixed(2) : '---';

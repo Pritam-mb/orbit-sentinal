@@ -9,8 +9,22 @@ import os
 import logging
 from datetime import datetime, timezone
 from app.core.sgp4_propagator import SGP4Propagator
+from app.core.conjunction import WARNING_DISTANCE_KM, find_tca
 
 logger = logging.getLogger(__name__)
+
+AGENCY_ALIASES = [
+    ("STARLINK", "SpaceX"),
+    ("SPACEX", "SpaceX"),
+    ("ISS", "ISS"),
+    ("COSMOS", "Roscosmos"),
+    ("RESURS", "Roscosmos"),
+    ("FENGYUN", "CNSA"),
+    ("YAOGAN", "CNSA"),
+    ("NOAA", "NOAA"),
+    ("HUBBLE", "NASA"),
+    ("IRIDIUM", "Iridium"),
+]
 
 SCENARIOS_DIR = os.path.join(os.path.dirname(__file__))
 
@@ -22,6 +36,66 @@ class SimEngine:
         self.propagator = propagator
         self.active_scenario = None
         self._scenario_sats = []
+
+    def _infer_agency(self, name: str) -> str:
+        upper_name = (name or "").upper()
+        for keyword, agency in AGENCY_ALIASES:
+            if keyword in upper_name:
+                return agency
+        return "Unknown"
+
+    def _clone_propagator(self) -> SGP4Propagator:
+        clone = SGP4Propagator()
+        with self.propagator._lock:
+            clone._satellites = dict(self.propagator._satellites)
+            clone._maneuvers = dict(self.propagator._maneuvers)
+        return clone
+
+    def _assess_future_conjunctions(self, propagator: SGP4Propagator, target_id: int, start_time: datetime) -> dict:
+        nearest = None
+
+        for other_id in propagator.norad_ids:
+            if other_id == target_id:
+                continue
+
+            event = find_tca(
+                propagator,
+                target_id,
+                other_id,
+                start=start_time,
+                hours_ahead=24.0,
+                steps=120,
+            )
+            if event is None:
+                continue
+
+            try:
+                event_time = datetime.fromisoformat(event.tca_utc)
+            except Exception:
+                event_time = start_time
+
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=timezone.utc)
+
+            event_minutes = max(0.0, (event_time - start_time).total_seconds() / 60.0)
+            if nearest is None or event.miss_distance_km < nearest["min_miss_distance_km"]:
+                nearest = {
+                    "other_id": other_id,
+                    "other_name": event.sat2_name if event.sat1_id == target_id else event.sat1_name,
+                    "min_miss_distance_km": float(event.miss_distance_km),
+                    "closest_tca_minutes": float(event_minutes),
+                    "tca_utc": event_time.isoformat(),
+                    "severity": event.severity,
+                }
+
+        return nearest or {
+            "other_id": None,
+            "other_name": None,
+            "min_miss_distance_km": None,
+            "closest_tca_minutes": None,
+            "tca_utc": None,
+            "severity": None,
+        }
 
     def load_scenario(self, scenario_name: str) -> dict:
         """
@@ -107,30 +181,58 @@ class SimEngine:
         return {**result, "preflight": preflight}
 
     def preflight_check(
-        self, norad_id: int, dvx: float, dvy: float, dvz: float
+        self, norad_id: int, dvx: float, dvy: float, dvz: float, frame: str = "RSW"
     ) -> dict:
         """
-        6-gate pre-flight validation.
-        Returns dict with gate statuses.
+        6-gate pre-flight validation based on cloned orbit simulation.
+        Returns dict with gate statuses and the nearest future encounter.
         """
         import numpy as np
 
         dv_magnitude = np.sqrt(dvx**2 + dvy**2 + dvz**2)
+        now = datetime.now(timezone.utc)
+        current_state = self.propagator.propagate_one(norad_id, now)
+        target_name = current_state.name if current_state is not None else f"NORAD-{norad_id}"
+        agency = self._infer_agency(target_name)
+        is_debris = "DEB" in target_name.upper()
 
+        cloned_propagator = self._clone_propagator()
+        burn_result = cloned_propagator.apply_delta_v(norad_id, dvx, dvy, dvz, frame=frame)
+
+        future_risk = None
         gates = {
-            "trajectory_clear": True,       # Gate 1: No collision in 24h
-            "fuel_budget": dv_magnitude <= 50.0,  # Gate 2: < 50 m/s budget
-            "agency_auth": True,            # Gate 3: Always authorized (demo)
-            "tca_window": True,             # Gate 4: Not in TCA window
-            "physical_limits": dv_magnitude <= 100.0,  # Gate 5: Thruster limit
-            "sim_dryrun": True,             # Gate 6: Dry run passes
+            "trajectory_clear": False,
+            "fuel_budget": dv_magnitude <= 50.0,
+            "agency_auth": not is_debris,
+            "tca_window": False,
+            "physical_limits": False,
+            "sim_dryrun": False,
         }
+
+        if burn_result.get("status") == "success":
+            future_risk = self._assess_future_conjunctions(cloned_propagator, norad_id, now)
+            min_miss = future_risk.get("min_miss_distance_km")
+            tca_minutes = future_risk.get("closest_tca_minutes")
+
+            gates.update({
+                "trajectory_clear": min_miss is None or min_miss > WARNING_DISTANCE_KM,
+                "tca_window": tca_minutes is None or tca_minutes > 60.0,
+                "physical_limits": burn_result.get("new_perigee_km", 0.0) >= 100.0 and dv_magnitude <= 100.0,
+                "sim_dryrun": True,
+            })
+
+        all_clear = all(gates.values())
 
         return {
             "norad_id": norad_id,
+            "satellite_name": target_name,
+            "agency": agency,
+            "frame": frame,
             "dv_magnitude_ms": round(dv_magnitude, 3),
             "gates": gates,
-            "all_clear": all(gates.values()),
+            "all_clear": all_clear,
+            "trajectory": future_risk,
+            "burn": burn_result,
         }
 
     def list_scenarios(self) -> list[str]:
