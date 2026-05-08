@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import logging
 import math
 from typing import Any
 
@@ -20,6 +21,8 @@ from app.core.conjunction import classify_severity
 from app.core.sgp4_propagator import SatelliteState, rsw_to_eci
 from app.ml.gnn_cascade import CascadeGNN
 from app.ml.xgboost_scorer import XGBoostScorer
+
+logger = logging.getLogger(__name__)
 
 R_EARTH_KM = 6371.0
 DEFAULT_INFLUENCE_RADIUS_KM = 200.0
@@ -217,10 +220,15 @@ class CascadePlanner:
                 "agencies_involved": [],
             }
 
-        node_features, edge_index, edge_attr = self._build_gnn_inputs(nodes, edges, node_index, adjacency)
-        gnn_output = self.gnn.predict(node_features, edge_index, edge_attr)
-        maneuver_probability = gnn_output["maneuver_probability"]
-        gnn_depth = gnn_output["cascade_depth"]
+        try:
+            node_features, edge_index, edge_attr = self._build_gnn_inputs(nodes, edges, node_index, adjacency)
+            gnn_output = self.gnn.predict(node_features, edge_index, edge_attr)
+            maneuver_probability = gnn_output["maneuver_probability"]
+            gnn_depth = gnn_output["cascade_depth"]
+        except Exception as error:
+            logger.warning("GNN cascade scoring failed, using fallback: %s", error)
+            maneuver_probability = np.zeros(len(nodes), dtype=float)
+            gnn_depth = np.zeros(len(nodes), dtype=int)
 
         ranked_nodes = sorted(
             nodes,
