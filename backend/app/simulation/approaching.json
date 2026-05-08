@@ -1,0 +1,25 @@
+{
+  "name": "approaching_conjunction",
+  "description": "Two satellites forced into a conjunction path with TCA ~30min from trigger",
+  "satellites": [
+    {
+      "name": "SAT-ALPHA",
+      "norad_id": 99901,
+      "line1": "1 99901U 24001A   24100.50000000  .00001000  00000-0  10000-3 0  9999",
+      "line2": "2 99901  51.6400 208.9163 0002526 105.8590 254.2771 15.49560532000001"
+    },
+    {
+      "name": "SAT-BRAVO",
+      "norad_id": 99902,
+      "line1": "1 99902U 24002A   24100.50000000  .00001000  00000-0  10000-3 0  9998",
+      "line2": "2 99902  51.6410 208.9200 0002530 105.8600 254.2700 15.49560532000002"
+    }
+  ],
+  "inject_offset_km": {
+    "sat_bravo_dx": 0.5,
+    "sat_bravo_dy": 0.3,
+    "sat_bravo_dz": -0.1
+  },
+  "tca_minutes_from_trigger": 30,
+  "expected_miss_distance_km": 2.5
+}

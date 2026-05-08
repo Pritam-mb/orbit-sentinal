@@ -1,0 +1,168 @@
+"""
+REST API routes for maneuvers, scenarios, and alerts.
+"""
+
+from datetime import datetime, timezone, timedelta
+from fastapi import APIRouter, HTTPException, Response
+from pydantic import BaseModel
+
+from app.core.state_cache import get_latest_alerts, get_latest_snapshot
+
+router = APIRouter(prefix="/api")
+
+
+class ManeuverRequest(BaseModel):
+    norad_id: int
+    dvx: float  # m/s
+    dvy: float
+    dvz: float
+
+
+class ScenarioRequest(BaseModel):
+    name: str
+
+
+# These will be set by main.py on startup
+_propagator = None
+_sim_engine = None
+
+
+def init_routes(propagator, sim_engine):
+    global _propagator, _sim_engine
+    _propagator = propagator
+    _sim_engine = sim_engine
+
+
+@router.get("/satellites")
+async def get_satellites():
+    """Get current satellite positions."""
+    snapshot = get_latest_snapshot()
+
+    payload = snapshot.get("payload")
+    if payload:
+        return Response(content=payload, media_type="application/json")
+
+    return {
+        "satellites": snapshot.get("satellites", []),
+        "count": snapshot.get("count", 0),
+        "timestamp": snapshot.get("timestamp"),
+    }
+
+
+@router.get("/satellites/{norad_id}")
+async def get_satellite_detail(norad_id: int):
+    """Get the full state for a single satellite."""
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    state = _propagator.propagate_one(norad_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Satellite not found")
+
+    return state.to_dict()
+
+
+@router.get("/alerts")
+async def get_alerts():
+    """Get current conjunction alerts."""
+    alerts_snapshot = get_latest_alerts()
+    return {
+        "alerts": alerts_snapshot.get("alerts", []),
+        "count": alerts_snapshot.get("count", 0),
+        "timestamp": alerts_snapshot.get("timestamp"),
+    }
+
+
+@router.get("/satellites/{norad_id}/orbit")
+async def get_satellite_orbit(
+    norad_id: int,
+    span_minutes: int = 90,
+    step_seconds: int = 60,
+):
+    """Get a short orbit track for the selected satellite."""
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    from datetime import timedelta
+
+    span_minutes = max(15, min(span_minutes, 180))
+    step_seconds = max(10, min(step_seconds, 300))
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=span_minutes / 2)
+    end = now + timedelta(minutes=span_minutes / 2)
+
+    orbit = []
+    current = start
+    while current <= end:
+      state = _propagator.propagate_one(norad_id, current)
+      if state is not None and state.error_code == 0:
+          orbit.append(
+              {
+                  "epoch_utc": state.epoch_utc,
+                  "position": {
+                      "x": state.x,
+                      "y": state.y,
+                      "z": state.z,
+                  },
+              }
+          )
+      current += timedelta(seconds=step_seconds)
+
+    if not orbit:
+        raise HTTPException(status_code=404, detail="Satellite not found")
+
+    return {
+        "norad_id": norad_id,
+        "generated_at": now.isoformat(),
+        "orbit": orbit,
+    }
+
+
+@router.post("/maneuver")
+async def execute_maneuver(req: ManeuverRequest):
+    """Execute a delta-V maneuver with pre-flight validation."""
+    if _sim_engine is None:
+        return {"status": "ERROR", "message": "Sim engine not initialized"}
+
+    result = _sim_engine.apply_maneuver(req.norad_id, req.dvx, req.dvy, req.dvz)
+    return result
+
+
+@router.post("/simulate")
+async def trigger_scenario(req: ScenarioRequest):
+    """Load a deterministic simulation scenario."""
+    if _sim_engine is None:
+        return {"status": "ERROR", "message": "Sim engine not initialized"}
+
+    try:
+        result = _sim_engine.load_scenario(req.name)
+        return {"status": "LOADED", **result}
+    except FileNotFoundError as e:
+        return {"status": "ERROR", "message": str(e)}
+
+
+@router.delete("/simulate")
+async def clear_scenario():
+    """Clear the active scenario."""
+    if _sim_engine:
+        _sim_engine.clear_scenario()
+    return {"status": "CLEARED"}
+
+
+@router.get("/scenarios")
+async def list_scenarios():
+    """List available simulation scenarios."""
+    if _sim_engine is None:
+        return {"scenarios": []}
+    return {"scenarios": _sim_engine.list_scenarios()}
+
+
+@router.post("/preflight")
+async def preflight_check(req: ManeuverRequest):
+    """Run pre-flight validation without executing."""
+    if _sim_engine is None:
+        return {"status": "ERROR"}
+
+    result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz)
+    return result
