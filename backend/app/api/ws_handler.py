@@ -1,6 +1,5 @@
 """
 WebSocket connection manager.
-<<<<<<< HEAD
 Handles multi-client connections and 1Hz satellite broadcast.
 
 Enhanced broadcast payload includes covariance_ellipse for satellites
@@ -10,14 +9,9 @@ uncertainty ellipses around threatened satellites.
 
 import asyncio
 import json
-=======
-Handles multi-client connections and periodic satellite broadcast.
-"""
-
-import asyncio
-import os
->>>>>>> a807e61320556541bc8c65f9ccd38523da4f391c
 import logging
+import os
+
 from fastapi import WebSocket
 from app.core.state_cache import get_latest_snapshot, get_latest_alerts
 
@@ -61,7 +55,7 @@ class ConnectionManager:
 
 def _build_covariance_index(alerts: list) -> dict:
     """
-    Build a lookup mapping norad_id → covariance_ellipse from active alerts.
+    Build a lookup mapping norad_id -> covariance_ellipse from active alerts.
 
     Each alert has sat1 and sat2 fields (both are threatened by the conjunction).
     The ellipse stored is from the Foster integration for that pair.
@@ -86,23 +80,19 @@ async def satellite_broadcast_loop(
     manager: ConnectionManager,
 ):
     """
-<<<<<<< HEAD
     Background task: broadcast the latest cached snapshot at 1Hz.
 
     Enriches the satellite list with covariance_ellipse fields from active
     conjunction alerts. Field is None for non-threatened satellites and
     contains ellipse parameters {a, b, angle, affection_rate, predicted_fragments}
     for satellites in active conjunctions.
-=======
-    Background task: broadcast the latest cached snapshot on a slower cadence.
->>>>>>> a807e61320556541bc8c65f9ccd38523da4f391c
     """
     while True:
         try:
             if manager.active_connections:
                 snapshot = get_latest_snapshot()
 
-                # ── Build covariance index from active alerts ──────────────
+                # Build covariance index from active alerts
                 try:
                     alerts_snapshot = get_latest_alerts()
                     active_alerts = alerts_snapshot.get("alerts", [])
@@ -110,7 +100,7 @@ async def satellite_broadcast_loop(
                 except Exception:
                     covariance_index = {}
 
-                # ── Build enriched satellite list ──────────────────────────
+                # Build enriched satellite list
                 satellites = snapshot.get("satellites", [])
                 if covariance_index:
                     enriched = []
@@ -126,7 +116,7 @@ async def satellite_broadcast_loop(
                     }
                     payload = json.dumps(payload_obj, separators=(",", ":"))
                 else:
-                    # No active conjunctions — use cached payload (faster)
+                    # No active conjunctions -- use cached payload (faster)
                     payload = snapshot.get("payload")
 
                 if payload:

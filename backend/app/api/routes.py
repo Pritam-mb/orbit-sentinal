@@ -209,6 +209,21 @@ async def get_model_metrics_endpoint():
     return get_model_metrics()
 
 
+@router.get("/cascade/status")
+async def get_cascade_status():
+    """Get the current cascade prediction status."""
+    alerts_snapshot = get_latest_alerts()
+    plan = alerts_snapshot.get("cascade_plan", [])
+    
+    predictions = len(plan)
+    depth = alerts_snapshot.get("cascade_depth", 0)
+    
+    return {
+        "cascade_predictions": predictions,
+        "mean_cascade_depth": depth,
+    }
+
+
 @router.get("/satellites/{norad_id}/orbit")
 async def get_satellite_orbit(
     norad_id: int,

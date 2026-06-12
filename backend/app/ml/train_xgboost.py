@@ -101,6 +101,10 @@ def generate_training_dataset(n_samples: int = 5000, seed: int = 42) -> list[dic
     np_rng = np.random.default_rng(seed)
     samples = []
 
+    # Target ~20% positive class to ensure stratified split works.
+    # Close-approach scenarios (miss < 0.5 km) reliably produce Pc > 1e-4.
+    POSITIVE_FRACTION = 0.20
+
     print(f"Generating {n_samples} Foster-based conjunction samples...")
     t_start = time.time()
 
@@ -110,21 +114,36 @@ def generate_training_dataset(n_samples: int = 5000, seed: int = 42) -> list[dic
             print(f"  {i+1}/{n_samples} samples ({elapsed:.1f}s elapsed)")
 
         try:
+            # ── Force positive-class scenarios at the target rate ────────
+            force_positive = rng.random() < POSITIVE_FRACTION
+
             # ── Physically realistic parameter sampling ──────────────────
             altitude_km = rng.uniform(200.0, 2000.0)
-            # Miss distance: log-normal — most conjunctions are far, few are close
-            miss_raw = np_rng.lognormal(mean=1.5, sigma=1.5)
-            miss_distance_km = float(np.clip(miss_raw, 0.001, 500.0))
-            # Relative velocity
+
+            if force_positive:
+                # Very close approach: miss 0.001 – 0.5 km, nearly coplanar,
+                # high rel-velocity crossings reliably push Pc above 1e-4.
+                miss_distance_km = float(np_rng.uniform(0.001, 0.5))
+            else:
+                # Background conjunction: log-normal, most are far
+                miss_raw = np_rng.lognormal(mean=2.5, sigma=1.2)
+                miss_distance_km = float(np.clip(miss_raw, 0.5, 500.0))
+
+            # Relative velocity km/s
             rel_vel_kms = rng.uniform(1.0, 15.0)
-            # TLE age
+
+            # TLE age hours
             tle_age_hours = rng.uniform(0.1, 48.0)
-            # Inclination difference
+
+            # Inclination difference (drives crossing geometry)
             inc_diff_deg = rng.uniform(0.0, 180.0)
 
-            # TCA estimate: time to close at relative velocity
-            tca_hours = miss_distance_km / rel_vel_kms / 3600.0 if rel_vel_kms > 0 else 12.0
-            tca_hours = max(0.001, min(tca_hours, 48.0))
+            # TCA: physically, close approaches happen minutes before TCA;
+            # use a realistic range rather than deriving from miss/vel.
+            if force_positive:
+                tca_hours = rng.uniform(0.05, 2.0)   # 3 min – 2 hr: urgent
+            else:
+                tca_hours = rng.uniform(0.5, 48.0)
 
             if _analytics_ok:
                 # ── Build states for Foster integration ──────────────────
@@ -132,9 +151,9 @@ def generate_training_dataset(n_samples: int = 5000, seed: int = 42) -> list[dic
                 inc_p = rng.uniform(20.0, 98.0)
                 state_p = _build_state_at_altitude(altitude_km, phase_p, inc_p)
 
-                # Place sat_q at miss_distance_km offset along a direction
-                # determined by relative velocity angle
+                # Place sat_q at miss_distance_km offset
                 inc_q = inc_p + inc_diff_deg * rng.uniform(-0.5, 0.5)
+                # angular offset corresponding to miss distance
                 phase_q = phase_p + (miss_distance_km / (6371 + altitude_km))
                 state_q_base = _build_state_at_altitude(altitude_km, phase_q, inc_q)
 
@@ -167,7 +186,7 @@ def generate_training_dataset(n_samples: int = 5000, seed: int = 42) -> list[dic
                 c_normal = (c_radial + c_transverse) / 2.0
             else:
                 # Fallback: simple Gaussian approximation
-                sigma = max(1.0, miss_distance_km / 6.0)
+                sigma = max(0.5, miss_distance_km / 6.0)
                 hbr = 0.010
                 p_collision = float(math.exp(-0.5 * (miss_distance_km / sigma) ** 2) * (hbr / sigma) ** 2)
                 p_collision = min(1.0, max(0.0, p_collision))
@@ -235,13 +254,21 @@ def train_and_save(samples: list[dict], model_path: str) -> Any:
     n_neg = int(len(y) - n_pos)
     if n_pos == 0:
         raise ValueError("No positive samples — cannot train binary classifier")
+    if n_neg == 0:
+        raise ValueError("No negative samples — cannot train binary classifier")
 
     class_weight = float(n_neg) / float(n_pos)
 
-    # Stratified 80/20 split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Stratified 80/20 split — fall back to random if class too rare for stratify
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+    except ValueError:
+        logger.warning("Stratified split failed (too few positive samples), using random split")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
 
     dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=FEATURE_NAMES)
     dtest = xgb.DMatrix(X_test, label=y_test, feature_names=FEATURE_NAMES)
