@@ -1,14 +1,14 @@
 import { create } from 'zustand';
 
 const useStore = create((set, get) => ({
-  // Satellite data
+  // ── Satellite data ──────────────────────────────────────────────────────────
   satellites: [],
   selectedSatelliteId: null,
   hoveredSatelliteId: null,
   selectedOrbit: [],
   snapshotTimestamp: null,
 
-  // Conjunction alerts
+  // ── Conjunction alerts ──────────────────────────────────────────────────────
   alerts: [],
   cascadePlan: null,
   hotspots: [],
@@ -17,19 +17,28 @@ const useStore = create((set, get) => ({
   simulationDrawerOpen: true,
   metricsDrawerOpen: true,
 
-  // Maneuver controls
+  // ── Maneuver controls ───────────────────────────────────────────────────────
   maneuver: { dvx: 0, dvy: 0, dvz: 0 },
 
-  // Connection status
+  // ── Connection status ───────────────────────────────────────────────────────
   wsConnected: false,
 
-  // Simulation
+  // ── Simulation ──────────────────────────────────────────────────────────────
   simulationActive: false,
 
-  // Agency filtering
+  // ── Agency filtering ────────────────────────────────────────────────────────
   agencyFilter: null,
 
-  // Actions
+  // ── NEW: Mission control state ──────────────────────────────────────────────
+  selectedAlertId: null,
+  simTimeOffset: 0,
+  backendConnected: false,
+  dataAgeSeconds: 0,
+  debrisFragments: [],
+  cascadeGraph: { nodes: [], edges: [] },
+  decisionLog: [],
+
+  // ── Existing actions ─────────────────────────────────────────────────────────
   setSatellites: (sats) => set({ satellites: sats }),
 
   setSnapshotTimestamp: (timestamp) => set({ snapshotTimestamp: timestamp }),
@@ -74,6 +83,24 @@ const useStore = create((set, get) => ({
   setSimulationActive: (active) => set({ simulationActive: active }),
 
   setAgencyFilter: (filter) => set({ agencyFilter: filter }),
+
+  // ── NEW actions ──────────────────────────────────────────────────────────────
+  setSelectedAlertId: (id) => set({ selectedAlertId: id }),
+
+  setSimTimeOffset: (h) => set({ simTimeOffset: h }),
+
+  setBackendConnected: (v) => set({ backendConnected: v }),
+
+  setDataAgeSeconds: (s) => set({ dataAgeSeconds: s }),
+
+  setDebrisFragments: (f) => set({ debrisFragments: f }),
+
+  setCascadeGraph: (g) => set({ cascadeGraph: g }),
+
+  addDecisionLogEntry: (e) =>
+    set((state) => ({
+      decisionLog: [e, ...state.decisionLog].slice(0, 100),
+    })),
 }));
 
 export default useStore;

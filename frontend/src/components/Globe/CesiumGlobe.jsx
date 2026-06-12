@@ -34,7 +34,7 @@ function setBillboardPosition(billboard, cartesian) {
   billboard.position = new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z);
 }
 
-const CesiumGlobe = () => {
+const CesiumGlobe = ({ mode = 'live', alerts = [], showDebris = false, debrisFragments = [], onSatelliteSelect, selectedSatId }) => {
   const viewerRef = useRef(null);
   const containerRef = useRef(null);
   const motionRef = useRef({
@@ -63,159 +63,192 @@ const CesiumGlobe = () => {
   });
   useEffect(() => {
     if (!containerRef.current || viewerRef.current) return;
+    let viewer = null;
+    let rafId = null;
+    let ro = null;
 
-    const viewer = new Cesium.Viewer(containerRef.current, {
-      // Show the earth globe with imagery
-      imageryProvider: false,
-      baseLayerPicker: false,
-      geocoder: false,
-      homeButton: false,
-      sceneModePicker: false,
-      navigationHelpButton: false,
-      animation: false,
-      timeline: false,
-      fullscreenButton: false,
-      vrButton: false,
-      infoBox: false,
-      selectionIndicator: false,
-      creditContainer: document.createElement('div'),
-    });
+    // Defer by one animation frame so the CSS Grid has committed its layout.
+    // Without this, Cesium reads zero/wrong container dimensions and either
+    // places the camera at the wrong distance or overflows the container.
+    rafId = requestAnimationFrame(() => {
+      if (!containerRef.current) return;
 
-    viewer.scene.requestRenderMode = false;
-    viewer.scene.maximumRenderTimeChange = 0;
-    viewer.scene.fxaa = false;
+      viewer = new Cesium.Viewer(containerRef.current, {
+        imageryProvider: false,
+        baseLayerPicker: false,
+        geocoder: false,
+        homeButton: false,
+        sceneModePicker: false,
+        navigationHelpButton: false,
+        animation: false,
+        timeline: false,
+        fullscreenButton: false,
+        vrButton: false,
+        infoBox: false,
+        selectionIndicator: false,
+        creditContainer: document.createElement('div'),
+      });
 
-    // Add local imagery
-    Cesium.SingleTileImageryProvider.fromUrl('/earth-realistic-8k.webp').then((provider) => {
-      if (!viewer.isDestroyed()) {
-        viewer.imageryLayers.addImageryProvider(provider);
+      viewer.scene.requestRenderMode = false;
+
+      // Threat mode: red-tinted space background
+      if (mode === 'threat') {
+        viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#0a0005');
+      }
+      viewer.scene.maximumRenderTimeChange = 0;
+      viewer.scene.fxaa = false;
+
+      // Add local imagery
+      Cesium.SingleTileImageryProvider.fromUrl('/earth-realistic-8k.webp').then((provider) => {
+        if (!viewer.isDestroyed()) {
+          viewer.imageryLayers.addImageryProvider(provider);
+          viewer.scene.requestRender();
+        }
+      }).catch(console.error);
+
+      // Black background, no atmosphere glow
+      viewer.scene.backgroundColor = Cesium.Color.BLACK;
+      viewer.scene.sun.show = false;
+      viewer.scene.moon.show = false;
+      viewer.scene.skyBox.show = false;
+      viewer.scene.skyAtmosphere.show = false;
+      viewer.scene.fog.enabled = false;
+      viewer.scene.globe.showGroundAtmosphere = false;
+      viewer.scene.globe.enableLighting = false;
+      viewer.scene.globe.depthTestAgainstTerrain = false;
+
+      // Set initial camera to see Earth from space
+      viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(30, 20, 25000000),
+      });
+
+      // Force Cesium to measure the real container size right now,
+      // then re-render so the globe fills the panel correctly.
+      viewer.resize();
+      viewer.scene.requestRender();
+
+      // Track container size changes (flex/grid can resize it later)
+      ro = new ResizeObserver(() => {
+        if (viewer && !viewer.isDestroyed()) {
+          viewer.resize();
+          viewer.scene.requestRender();
+        }
+      });
+      ro.observe(containerRef.current);
+
+      // Initialize Collections for high-performance rendering
+      const billboards = new Cesium.BillboardCollection({
+        blendOption: Cesium.BlendOption.TRANSLUCENT,
+      });
+      const labels = new Cesium.LabelCollection();
+      const orbitLines = new Cesium.PolylineCollection();
+      const hotspotPoints = new Cesium.PointPrimitiveCollection();
+      viewer.scene.primitives.add(billboards);
+      viewer.scene.primitives.add(labels);
+      viewer.scene.primitives.add(orbitLines);
+      viewer.scene.primitives.add(hotspotPoints);
+
+      const focusLabel = labels.add({
+        show: false,
+        text: '',
+        font: '11px JetBrains Mono',
+        fillColor: Cesium.Color.fromCssColorString('#f3f4f6'),
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(15, -5),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      });
+
+      const orbitMaterial = Cesium.Material.fromType('Color');
+      orbitMaterial.uniforms.color = Cesium.Color.fromCssColorString('#22c55e').withAlpha(0.8);
+
+      const approachMaterial = Cesium.Material.fromType('Color');
+      approachMaterial.uniforms.color = Cesium.Color.fromCssColorString('#22c55e').withAlpha(0.9);
+
+      const orbitPolyline = orbitLines.add({
+        show: false,
+        positions: [],
+        width: 2,
+        material: orbitMaterial,
+        arcType: Cesium.ArcType.NONE,
+        id: 'selected-orbit',
+      });
+
+      const approachLine = orbitLines.add({
+        show: false,
+        positions: [],
+        width: 2,
+        material: approachMaterial,
+        arcType: Cesium.ArcType.NONE,
+        id: 'approach-line',
+      });
+
+      primitivesRef.current.billboards = billboards;
+      primitivesRef.current.labels = labels;
+      primitivesRef.current.orbitLines = orbitLines;
+      primitivesRef.current.focusLabel = focusLabel;
+      primitivesRef.current.orbitPolyline = orbitPolyline;
+      primitivesRef.current.orbitMaterial = orbitMaterial;
+      primitivesRef.current.approachLine = approachLine;
+      primitivesRef.current.approachMaterial = approachMaterial;
+      primitivesRef.current.hotspotPoints = hotspotPoints;
+      primitivesRef.current.hotspotZones = [];
+      primitivesRef.current.debrisEntities = [];
+
+      // Hover and click handlers for satellite focus
+      const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+      const updateHoveredSatellite = (position) => {
+        const picked = viewer.scene.pick(position);
+        const nextHoveredId = Cesium.defined(picked) && typeof picked.id === 'number'
+          ? picked.id
+          : null;
+        const store = useStore.getState();
+
+        if (store.hoveredSatelliteId !== nextHoveredId) {
+          store.setHoveredSatelliteId(nextHoveredId);
+        }
+
         viewer.scene.requestRender();
-      }
-    }).catch(console.error);
+        return nextHoveredId;
+      };
 
-    // Black background, no atmosphere glow
-    viewer.scene.backgroundColor = Cesium.Color.BLACK;
-    viewer.scene.sun.show = false;
-    viewer.scene.moon.show = false;
-    viewer.scene.skyBox.show = false;
-    viewer.scene.skyAtmosphere.show = false;
-    viewer.scene.fog.enabled = false;
-    viewer.scene.globe.showGroundAtmosphere = false;
-    viewer.scene.globe.enableLighting = false;
-    viewer.scene.globe.depthTestAgainstTerrain = false;
+      handler.setInputAction((movement) => {
+        updateHoveredSatellite(movement.endPosition);
+      }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
 
-    // Set initial camera to see Earth from space
-    viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(30, 20, 25000000),
+      handler.setInputAction((click) => {
+        const pickedId = updateHoveredSatellite(click.position);
+        if (pickedId) {
+          useStore.getState().setSelectedSatelliteId(pickedId);
+          if (onSatelliteSelect) onSatelliteSelect(pickedId);
+        }
+      }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+      const clearHover = () => {
+        const store = useStore.getState();
+        if (store.hoveredSatelliteId !== null) {
+          store.setHoveredSatelliteId(null);
+        }
+        viewer.scene.requestRender();
+      };
+
+      viewer.scene.canvas.addEventListener('mouseleave', clearHover);
+      viewerRef.current = viewer;
+
+      // Store cleanup handles so the return callback can reach them
+      viewerRef._handler = handler;
+      viewerRef._clearHover = clearHover;
     });
-    viewer.scene.requestRender();
-
-    // Initialize Collections for high-performance rendering
-    const billboards = new Cesium.BillboardCollection({
-      blendOption: Cesium.BlendOption.TRANSLUCENT,
-    });
-    const labels = new Cesium.LabelCollection();
-    const orbitLines = new Cesium.PolylineCollection();
-    const hotspotPoints = new Cesium.PointPrimitiveCollection();
-    viewer.scene.primitives.add(billboards);
-    viewer.scene.primitives.add(labels);
-    viewer.scene.primitives.add(orbitLines);
-    viewer.scene.primitives.add(hotspotPoints);
-
-    const focusLabel = labels.add({
-      show: false,
-      text: '',
-      font: '11px JetBrains Mono',
-      fillColor: Cesium.Color.fromCssColorString('#f3f4f6'),
-      outlineColor: Cesium.Color.BLACK,
-      outlineWidth: 2,
-      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-      pixelOffset: new Cesium.Cartesian2(15, -5),
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-    });
-
-    const orbitMaterial = Cesium.Material.fromType('Color');
-    orbitMaterial.uniforms.color = Cesium.Color.fromCssColorString('#22c55e').withAlpha(0.8);
-
-    const approachMaterial = Cesium.Material.fromType('Color');
-    approachMaterial.uniforms.color = Cesium.Color.fromCssColorString('#22c55e').withAlpha(0.9);
-
-    const orbitPolyline = orbitLines.add({
-      show: false,
-      positions: [],
-      width: 2,
-      material: orbitMaterial,
-      arcType: Cesium.ArcType.NONE,
-      id: 'selected-orbit',
-    });
-
-    const approachLine = orbitLines.add({
-      show: false,
-      positions: [],
-      width: 2,
-      material: approachMaterial,
-      arcType: Cesium.ArcType.NONE,
-      id: 'approach-line',
-    });
-
-    primitivesRef.current.billboards = billboards;
-    primitivesRef.current.labels = labels;
-    primitivesRef.current.orbitLines = orbitLines;
-    primitivesRef.current.focusLabel = focusLabel;
-    primitivesRef.current.orbitPolyline = orbitPolyline;
-    primitivesRef.current.orbitMaterial = orbitMaterial;
-    primitivesRef.current.approachLine = approachLine;
-    primitivesRef.current.approachMaterial = approachMaterial;
-    primitivesRef.current.hotspotPoints = hotspotPoints;
-    primitivesRef.current.hotspotZones = [];
-    primitivesRef.current.debrisEntities = [];
-
-    // Hover and click handlers for satellite focus
-    const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
-    const updateHoveredSatellite = (position) => {
-      const picked = viewer.scene.pick(position);
-      const nextHoveredId = Cesium.defined(picked) && typeof picked.id === 'number'
-        ? picked.id
-        : null;
-      const store = useStore.getState();
-
-      if (store.hoveredSatelliteId !== nextHoveredId) {
-        store.setHoveredSatelliteId(nextHoveredId);
-      }
-
-      viewer.scene.requestRender();
-      return nextHoveredId;
-    };
-
-    handler.setInputAction((movement) => {
-      updateHoveredSatellite(movement.endPosition);
-    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
-
-    handler.setInputAction((click) => {
-      const pickedId = updateHoveredSatellite(click.position);
-      if (pickedId) {
-        useStore.getState().setSelectedSatelliteId(pickedId);
-      }
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
-
-    const clearHover = () => {
-      const store = useStore.getState();
-      if (store.hoveredSatelliteId !== null) {
-        store.setHoveredSatelliteId(null);
-      }
-
-      viewer.scene.requestRender();
-    };
-
-    viewer.scene.canvas.addEventListener('mouseleave', clearHover);
-
-    viewerRef.current = viewer;
 
     return () => {
-      handler.destroy();
-      viewer.scene.canvas.removeEventListener('mouseleave', clearHover);
-      if (viewer && !viewer.isDestroyed()) {
-        viewer.destroy();
+      if (rafId) cancelAnimationFrame(rafId);
+      if (ro) ro.disconnect();
+      const v = viewerRef.current;
+      if (v) {
+        try { viewerRef._handler?.destroy(); } catch (_) {}
+        try { v.scene.canvas.removeEventListener('mouseleave', viewerRef._clearHover); } catch (_) {}
+        if (!v.isDestroyed()) v.destroy();
       }
       viewerRef.current = null;
     };
@@ -238,9 +271,26 @@ const CesiumGlobe = () => {
   const computed = useTestMode((s) => s.computed);
   const selectedAId = useTestMode((s) => s.selectedA?.norad_id ?? null);
   const selectedBId = useTestMode((s) => s.selectedB?.norad_id ?? null);
-  const visibleSats = agencyFilter
-    ? satellites.filter((sat) => agencyFilter.includes(sat.agency))
-    : satellites;
+  // In threat mode only render satellites that appear in alerts
+  const alertSatIds = React.useMemo(() => {
+    if (mode !== 'threat') return null;
+    const ids = new Set();
+    for (const a of alerts) {
+      if (a.sat1?.id != null) ids.add(a.sat1.id);
+      if (a.sat2?.id != null) ids.add(a.sat2.id);
+    }
+    return ids;
+  }, [mode, alerts]);
+
+  const visibleSats = React.useMemo(() => {
+    let base = agencyFilter
+      ? satellites.filter((sat) => agencyFilter.includes(sat.agency))
+      : satellites;
+    if (alertSatIds !== null) {
+      base = base.filter((s) => alertSatIds.has(s.norad_id));
+    }
+    return base;
+  }, [satellites, agencyFilter, alertSatIds]);
 
   useEffect(() => {
     const viewer = viewerRef.current;
@@ -805,7 +855,7 @@ const CesiumGlobe = () => {
   return (
     <div
       ref={containerRef}
-      style={{ width: '100%', height: '100%', background: '#000' }}
+      style={{ width: '100%', height: '100%', background: mode === 'threat' ? '#0a0005' : '#000' }}
     />
   );
 };

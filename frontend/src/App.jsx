@@ -1,37 +1,64 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, Suspense } from 'react';
 import CesiumGlobe from './components/Globe/CesiumGlobe';
-import TelemetryPanel from './components/Telemetry/TelemetryPanel';
-import ConjunctionMonitor from './components/ConjunctionMonitor';
-import AlertPanel from './components/Alert/AlertPanel';
+import ThreatGlobe from './components/ThreatGlobe';
+import Header from './components/Header';
+import ConnectionBanner from './components/ConnectionBanner';
+import MissionControlCenter from './components/MissionControlCenter';
+import TelemetryStrip from './components/TelemetryStrip';
+import UplinkDownlinkV2 from './components/Control/UplinkDownlinkV2';
+import CascadeDiagram from './components/CascadeDiagram';
+import ModelStatusV2 from './components/ModelStatusV2';
 import SimulationDrawer from './components/SimulationDrawer';
 import MetricsDrawer from './components/MetricsDrawer';
-import UplinkDownlinkPanel from './components/Control/UplinkDownlinkPanel';
-import SimulationTimeControl from './components/Control/SimulationTimeControl';
-import AgencyFilter from './components/Globe/AgencyFilter';
 import useStore from './store/useStore';
 import useTestMode from './hooks/useTestMode';
+import { buildCascadeGraph } from './utils/cascadeGraph';
 import './App.css';
 
-const apiBaseUrl = '';
 const wsBaseUrl = (window.location.origin || '').replace(/^http/, 'ws');
 const alertPollMs = 30000;
 const heartbeatPollMs = 20000;
 
+function GlobeLoader() {
+  return (
+    <div style={{
+      width: '100%', height: '100%', background: '#000',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2 }}>
+        LOADING GLOBE…
+      </span>
+    </div>
+  );
+}
+
 function App() {
-  const setSatellites = useStore((s) => s.setSatellites);
+  // ── Store subscriptions ────────────────────────────────────────────────────
+  const setSatellites        = useStore((s) => s.setSatellites);
   const setSnapshotTimestamp = useStore((s) => s.setSnapshotTimestamp);
-  const setAlerts = useStore((s) => s.setAlerts);
-  const setCascadePlan = useStore((s) => s.setCascadePlan);
-  const setHotspots = useStore((s) => s.setHotspots);
-  const setDebrisClouds = useStore((s) => s.setDebrisClouds);
-  const setModelMetrics = useStore((s) => s.setModelMetrics);
-  const setWsConnected = useStore((s) => s.setWsConnected);
-  const wsConnected = useStore((s) => s.wsConnected);
-  const satellites = useStore((s) => s.satellites);
-  const testActive = useTestMode((s) => s.testActive);
+  const setAlerts            = useStore((s) => s.setAlerts);
+  const setCascadePlan       = useStore((s) => s.setCascadePlan);
+  const setHotspots          = useStore((s) => s.setHotspots);
+  const setDebrisClouds      = useStore((s) => s.setDebrisClouds);
+  const setModelMetrics      = useStore((s) => s.setModelMetrics);
+  const setWsConnected       = useStore((s) => s.setWsConnected);
+  const setCascadeGraph      = useStore((s) => s.setCascadeGraph);
+
+  const satellites        = useStore((s) => s.satellites);
+  const alerts            = useStore((s) => s.alerts);
+  const wsConnected       = useStore((s) => s.wsConnected);
+  const selectedSatelliteId = useStore((s) => s.selectedSatelliteId);
+  const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
+  const selectedAlertId   = useStore((s) => s.selectedAlertId);
+  const agencyFilter      = useStore((s) => s.agencyFilter);
+  const simTimeOffset     = useStore((s) => s.simTimeOffset);
+  const debrisFragments   = useStore((s) => s.debrisFragments);
+  const cascadeGraph      = useStore((s) => s.cascadeGraph);
+
   const wsRef = useRef(null);
   const alertFetchInFlight = useRef(false);
 
+  // ── WebSocket + polling ────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
     let reconnectTimer = null;
@@ -40,71 +67,53 @@ function App() {
 
     const bootstrapSatellites = async () => {
       try {
-        const satelliteResponse = await fetch(`${apiBaseUrl}/api/satellites`);
-        if (cancelled || !satelliteResponse.ok) return;
-
-        const satelliteData = await satelliteResponse.json();
-        setSnapshotTimestamp(satelliteData.timestamp || null);
-        setSatellites(satelliteData.satellites || []);
-      } catch (error) {
-        console.error('Initial satellite bootstrap failed:', error);
+        const res = await fetch('/api/satellites');
+        if (cancelled || !res.ok) return;
+        const data = await res.json();
+        setSnapshotTimestamp(data.timestamp || null);
+        setSatellites(data.satellites || []);
+      } catch (e) {
+        console.error('Satellite bootstrap failed:', e);
       }
     };
 
     const bootstrapAlerts = async () => {
       if (cancelled || alertFetchInFlight.current) return;
-
       alertFetchInFlight.current = true;
       try {
-        const alertResponse = await fetch(`${apiBaseUrl}/api/alerts`);
-        if (cancelled || !alertResponse.ok) return;
-
-        const alertData = await alertResponse.json();
+        const res = await fetch('/api/alerts');
+        if (cancelled || !res.ok) return;
+        const data = await res.json();
         if (!cancelled) {
-          setAlerts(alertData.alerts || []);
-          setCascadePlan(alertData.cascade_plan || null);
-          setHotspots(alertData.hotspots || []);
-          setDebrisClouds(alertData.debris_clouds || []);
+          setAlerts(data.alerts || []);
+          setCascadePlan(data.cascade_plan || null);
+          setHotspots(data.hotspots || []);
+          setDebrisClouds(data.debris_clouds || []);
         }
-      } catch (error) {
-        console.error('Initial alert bootstrap failed:', error);
+      } catch (e) {
+        console.error('Alert bootstrap failed:', e);
       } finally {
         alertFetchInFlight.current = false;
       }
     };
 
     const bootstrapModelMetrics = async () => {
-      if (cancelled) return;
-
       try {
-        const response = await fetch(`${apiBaseUrl}/api/model-metrics`);
-        if (cancelled || !response.ok) return;
-
-        const metricsData = await response.json();
-        if (!cancelled) {
-          setModelMetrics(metricsData);
-        }
-      } catch (error) {
-        console.error('Model metrics bootstrap failed:', error);
-      }
+        const res = await fetch('/api/model-metrics');
+        if (cancelled || !res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setModelMetrics(data);
+      } catch (_) {}
     };
 
     const connect = () => {
       if (cancelled) return;
-
       const ws = new WebSocket(`${wsBaseUrl}/ws/satellites`);
 
       ws.onopen = () => {
-        console.log('WebSocket connected');
         setWsConnected(true);
         heartbeatTimer = setInterval(() => {
-          try {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send('ping');
-            }
-          } catch (error) {
-            console.warn('WebSocket heartbeat failed:', error);
-          }
+          try { if (ws.readyState === WebSocket.OPEN) ws.send('ping'); } catch (_) {}
         }, heartbeatPollMs);
       };
 
@@ -127,21 +136,12 @@ function App() {
       };
 
       ws.onclose = () => {
-        console.log('WebSocket disconnected, reconnecting...');
         setWsConnected(false);
-        if (heartbeatTimer) {
-          clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
-        if (!cancelled) {
-          reconnectTimer = setTimeout(connect, 3000);
-        }
+        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+        if (!cancelled) reconnectTimer = setTimeout(connect, 3000);
       };
 
-      ws.onerror = () => {
-        ws.close();
-      };
-
+      ws.onerror = () => ws.close();
       wsRef.current = ws;
     };
 
@@ -150,72 +150,70 @@ function App() {
     bootstrapModelMetrics();
     connect();
 
-    alertPollTimer = setInterval(() => {
-      bootstrapAlerts();
-    }, alertPollMs);
+    alertPollTimer = setInterval(bootstrapAlerts, alertPollMs);
 
     return () => {
       cancelled = true;
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-      }
-      if (alertPollTimer) {
-        clearInterval(alertPollTimer);
-      }
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (alertPollTimer) clearInterval(alertPollTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (wsRef.current) wsRef.current.close();
     };
   }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setHotspots, setDebrisClouds, setModelMetrics, setWsConnected]);
 
+  // ── Build cascade graph whenever alerts change ─────────────────────────────
+  useEffect(() => {
+    const graph = buildCascadeGraph(alerts);
+    setCascadeGraph(graph);
+  }, [alerts, setCascadeGraph]);
+
   return (
-    <div className="app-container">
-      <header className="app-header">
-        <h1>ORBITAL SENTINEL</h1>
-        <div className="header-status">
-          <span
-            className="status-dot"
-            style={{
-              background: wsConnected
-                ? 'var(--alert-green)'
-                : 'var(--alert-red)',
-            }}
+    <div className="mission-control">
+      {/* Offline banner (fixed, above everything) */}
+      <ConnectionBanner />
+
+      {/* Row 1: Header (48px) */}
+      <Header />
+
+      {/* Row 2: Dual globe + mission control center */}
+      <div className="main-grid">
+        <div className="live-globe-panel">
+          <div className="panel-label">LIVE CATALOG</div>
+          <Suspense fallback={<GlobeLoader />}>
+            <CesiumGlobe
+              mode="live"
+              satellites={satellites}
+              alerts={alerts}
+              selectedSatId={selectedSatelliteId}
+              onSatelliteSelect={setSelectedSatelliteId}
+              agencyFilter={agencyFilter}
+            />
+          </Suspense>
+        </div>
+
+        <MissionControlCenter alerts={alerts} />
+
+        <div className="threat-globe-panel">
+          <div className="panel-label">THREAT ANALYSIS</div>
+          <ThreatGlobe
+            alerts={alerts}
+            satellites={satellites}
+            selectedSatId={selectedSatelliteId}
           />
-          <span>{wsConnected ? 'TRACKING' : 'OFFLINE'}</span>
         </div>
-        <div className="header-right">
-          <div className="header-meta">
-            {satellites.length} OBJECTS TRACKED
-          </div>
-          <button 
-            type="button" 
-            className={`header-test ${testActive ? 'active' : ''}`}
-            onClick={() => useTestMode.getState().setTestActive(!testActive)}
-          >
-            TEST MODE: {testActive ? 'ON' : 'OFF'}
-          </button>
-        </div>
-      </header>
+      </div>
 
-      <main className="bento-grid">
-        <div className="globe-panel">
-          <CesiumGlobe />
-          <TelemetryPanel />
-        </div>
+      {/* Row 3: Telemetry strip (72px) */}
+      <TelemetryStrip selectedSatId={selectedSatelliteId} />
 
-        <div className="sidebar">
-          <div className="sidebar-top">
-            <AgencyFilter />
-            <SimulationTimeControl />
-            <AlertPanel />
-            <UplinkDownlinkPanel />
-          </div>
-        </div>
-      </main>
+      {/* Row 4: Bottom three panels */}
+      <div className="bottom-grid">
+        <UplinkDownlinkV2 selectedSatId={selectedSatelliteId} />
+        <CascadeDiagram graph={cascadeGraph} alerts={alerts} />
+        <ModelStatusV2 />
+      </div>
 
+      {/* Preserved floating drawers (simulation & metrics controls) */}
       <MetricsDrawer />
       <SimulationDrawer />
     </div>
