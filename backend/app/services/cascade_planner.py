@@ -11,13 +11,14 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import logging
+from datetime import datetime, timezone
 import math
 from typing import Any
 
 import numpy as np
 from scipy.spatial import cKDTree
 
-from app.core.conjunction import classify_severity
+from app.core.conjunction import classify_severity, find_tca
 from app.core.sgp4_propagator import SatelliteState, rsw_to_eci
 from app.ml.gnn_cascade import CascadeGNN
 from app.ml.xgboost_scorer import XGBoostScorer
@@ -66,6 +67,21 @@ def _norm(vec: np.ndarray) -> float:
     return float(np.linalg.norm(vec))
 
 
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
 def _estimate_linear_tca_minutes(
     pos_a: np.ndarray,
     vel_a: np.ndarray,
@@ -85,6 +101,10 @@ def _estimate_linear_tca_minutes(
 
     closest_position = relative_position + (relative_velocity * t_seconds)
     return t_seconds / 60.0, _norm(closest_position)
+
+
+def _midpoint_position(pos_a: np.ndarray, pos_b: np.ndarray) -> np.ndarray:
+    return (pos_a + pos_b) / 2.0
 
 
 def _build_node(state: SatelliteState) -> CascadeNode:
@@ -112,12 +132,16 @@ class CascadePlanner:
         self,
         states: list[SatelliteState],
         influence_radius_km: float = DEFAULT_INFLUENCE_RADIUS_KM,
+        propagator: Any | None = None,
+        reference_time: datetime | None = None,
+        refine_limit: int = 30,
     ) -> dict[str, Any]:
         nodes = [_build_node(state) for state in states if state.error_code == 0]
         if not nodes:
             return {
                 "nodes": [],
                 "edges": [],
+                "hotspots": [],
                 "adjacency": {},
                 "summary": {
                     "node_count": 0,
@@ -134,6 +158,7 @@ class CascadePlanner:
         edges: list[dict[str, Any]] = []
         adjacency: dict[int, list[dict[str, Any]]] = {node.norad_id: [] for node in nodes}
         node_index = {node.norad_id: idx for idx, node in enumerate(nodes)}
+        node_lookup = {node.norad_id: node for node in nodes}
 
         for idx_a, idx_b in candidate_pairs:
             node_a = nodes[idx_a]
@@ -147,6 +172,38 @@ class CascadePlanner:
                 node_b.velocity,
             )
 
+            tca_utc = None
+            hotspot_position = _midpoint_position(node_a.position, node_b.position)
+
+            if propagator is not None:
+                start_time = reference_time or datetime.now(timezone.utc)
+                tca_event = find_tca(
+                    propagator,
+                    node_a.norad_id,
+                    node_b.norad_id,
+                    start=start_time,
+                    hours_ahead=24.0,
+                    steps=120,
+                )
+
+                if tca_event is not None:
+                    exact_tca = _parse_datetime(tca_event.tca_utc)
+                    if exact_tca is not None:
+                        state_a = propagator.propagate_one(node_a.norad_id, exact_tca)
+                        state_b = propagator.propagate_one(node_b.norad_id, exact_tca)
+                        if state_a is not None and state_b is not None and state_a.error_code == 0 and state_b.error_code == 0:
+                            pos_a = np.array([state_a.x, state_a.y, state_a.z], dtype=float)
+                            pos_b = np.array([state_b.x, state_b.y, state_b.z], dtype=float)
+                            vel_a = np.array([state_a.vx, state_a.vy, state_a.vz], dtype=float)
+                            vel_b = np.array([state_b.vx, state_b.vy, state_b.vz], dtype=float)
+
+                            miss_distance_km = _norm(pos_a - pos_b)
+                            relative_velocity_kms = _norm(vel_a - vel_b)
+                            tca_minutes = max(0.0, (exact_tca - start_time).total_seconds() / 60.0)
+                            predicted_miss_km = miss_distance_km
+                            tca_utc = exact_tca.isoformat()
+                            hotspot_position = _midpoint_position(pos_a, pos_b)
+
             risk_features = {
                 "miss_distance_km": predicted_miss_km,
                 "relative_speed_kmh": relative_velocity_kms * 3600.0,
@@ -158,6 +215,7 @@ class CascadePlanner:
             cpi_score = self._compute_cpi(predicted_miss_km, relative_velocity_kms, tca_minutes, p_collision)
             severity = classify_severity(predicted_miss_km)
             influence_weight = 1.0 / max(predicted_miss_km, 1.0)
+            hotspot_score = self._compute_hotspot_score(cpi_score, p_collision, predicted_miss_km, tca_minutes)
 
             edge_ab = {
                 "source_id": node_a.norad_id,
@@ -170,10 +228,17 @@ class CascadePlanner:
                 "predicted_miss_distance_km": round(float(predicted_miss_km), 3),
                 "relative_velocity_kmh": round(float(relative_velocity_kms * 3600.0), 2),
                 "tca_minutes": round(float(tca_minutes), 2),
+                "tca_utc": tca_utc,
                 "p_collision": round(float(p_collision), 4),
                 "cpi_score": round(float(cpi_score), 2),
+                "hotspot_score": round(float(hotspot_score), 3),
                 "severity": severity,
                 "influence_weight": round(float(influence_weight), 6),
+                "hotspot_position": {
+                    "x": round(float(hotspot_position[0]), 3),
+                    "y": round(float(hotspot_position[1]), 3),
+                    "z": round(float(hotspot_position[2]), 3),
+                },
             }
             edge_ba = {**edge_ab, "source_id": node_b.norad_id, "target_id": node_a.norad_id, "source_name": node_b.name, "target_name": node_a.name, "source_index": idx_b, "target_index": idx_a}
 
@@ -181,9 +246,40 @@ class CascadePlanner:
             adjacency[node_a.norad_id].append(edge_ab)
             adjacency[node_b.norad_id].append(edge_ba)
 
+        if propagator is not None and edges:
+            refine_count = min(len(edges), max(refine_limit, 1))
+            edges_to_refine = sorted(edges, key=lambda item: item["cpi_score"], reverse=True)[:refine_count]
+            for edge in edges_to_refine:
+                refined = self._refine_edge_with_tca(
+                    node_lookup[edge["source_id"]],
+                    node_lookup[edge["target_id"]],
+                    edge,
+                    propagator,
+                    reference_time or datetime.now(timezone.utc),
+                )
+                if refined is not None:
+                    edge.update(refined)
+
+            adjacency = {node.norad_id: [] for node in nodes}
+            for edge in edges:
+                edge_ba = {
+                    **edge,
+                    "source_id": edge["target_id"],
+                    "target_id": edge["source_id"],
+                    "source_name": edge["target_name"],
+                    "target_name": edge["source_name"],
+                    "source_index": edge["target_index"],
+                    "target_index": edge["source_index"],
+                }
+                adjacency[edge["source_id"]].append(edge)
+                adjacency[edge["target_id"]].append(edge_ba)
+
+        hotspots = self._serialize_hotspots(edges)
+
         return {
             "nodes": nodes,
             "edges": edges,
+            "hotspots": hotspots,
             "adjacency": adjacency,
             "node_index": node_index,
             "positions": positions,
@@ -199,14 +295,22 @@ class CascadePlanner:
         self,
         states: list[SatelliteState],
         alerts: list[dict[str, Any]] | None = None,
+        propagator: Any | None = None,
+        reference_time: datetime | None = None,
         influence_radius_km: float = DEFAULT_INFLUENCE_RADIUS_KM,
         cpi_threshold: float = DEFAULT_CPI_THRESHOLD,
         max_depth: int = 3,
         max_maneuvers: int = 50,
     ) -> dict[str, Any]:
-        graph = self.build_graph(states, influence_radius_km=influence_radius_km)
+        graph = self.build_graph(
+            states,
+            influence_radius_km=influence_radius_km,
+            propagator=propagator,
+            reference_time=reference_time,
+        )
         nodes: list[CascadeNode] = graph["nodes"]
         edges: list[dict[str, Any]] = graph["edges"]
+        hotspots: list[dict[str, Any]] = graph.get("hotspots", [])
         adjacency: dict[int, list[dict[str, Any]]] = graph["adjacency"]
         node_index: dict[int, int] = graph["node_index"]
 
@@ -215,6 +319,7 @@ class CascadePlanner:
                 "graph": graph["summary"],
                 "alerts": [],
                 "cascade_plan": [],
+                "hotspots": [],
                 "total_delta_v_ms": 0.0,
                 "cascade_depth": 0,
                 "agencies_involved": [],
@@ -329,6 +434,7 @@ class CascadePlanner:
         return {
             "graph": graph["summary"],
             "alerts": self._serialize_alerts(edges),
+            "hotspots": hotspots,
             "cascade_plan": resolved_maneuvers,
             "seed_satellites": seed_ids,
             "total_delta_v_ms": total_delta_v_ms,
@@ -449,12 +555,111 @@ class CascadePlanner:
                     "sat2": {"id": item["target_id"], "name": item["target_name"]},
                     "miss_distance_km": item["predicted_miss_distance_km"],
                     "relative_speed_kmh": item["relative_velocity_kmh"],
-                    "tca_utc": None,
+                    "tca_utc": item.get("tca_utc"),
+                    "tca_minutes": item.get("tca_minutes"),
                     "severity": item["severity"],
                     "cpi_score": item["cpi_score"],
                     "p_collision": item["p_collision"],
+                    "hotspot_score": item.get("hotspot_score", 0.0),
                     "influence_weight": item["influence_weight"],
                 }
             )
 
         return normalized
+
+    def _serialize_hotspots(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        hotspots = []
+        for item in sorted(edges, key=lambda edge: edge.get("hotspot_score", 0.0), reverse=True):
+            hotspot_position = item.get("hotspot_position") or {"x": 0.0, "y": 0.0, "z": 0.0}
+            hotspots.append(
+                {
+                    "sat1": {"id": item["source_id"], "name": item["source_name"]},
+                    "sat2": {"id": item["target_id"], "name": item["target_name"]},
+                    "tca_utc": item.get("tca_utc"),
+                    "tca_minutes": item.get("tca_minutes"),
+                    "miss_distance_km": item["predicted_miss_distance_km"],
+                    "relative_speed_kmh": item["relative_velocity_kmh"],
+                    "cpi_score": item["cpi_score"],
+                    "p_collision": item["p_collision"],
+                    "severity": item["severity"],
+                    "hotspot_score": item.get("hotspot_score", 0.0),
+                    "position": hotspot_position,
+                }
+            )
+
+        return hotspots
+
+    def _compute_hotspot_score(
+        self,
+        cpi_score: float,
+        p_collision: float,
+        miss_distance_km: float,
+        tca_minutes: float,
+    ) -> float:
+        proximity_component = max(0.0, 1.0 - (miss_distance_km / 500.0))
+        time_component = 1.0 / (1.0 + (max(tca_minutes, 0.0) / 60.0))
+        cpi_component = min(max(cpi_score / 10.0, 0.0), 1.0)
+        score = (0.40 * p_collision) + (0.30 * cpi_component) + (0.20 * proximity_component) + (0.10 * time_component)
+        return max(0.0, min(1.0, score))
+
+    def _refine_edge_with_tca(
+        self,
+        node_a: CascadeNode,
+        node_b: CascadeNode,
+        edge: dict[str, Any],
+        propagator: Any,
+        reference_time: datetime,
+    ) -> dict[str, Any] | None:
+        tca_event = find_tca(
+            propagator,
+            node_a.norad_id,
+            node_b.norad_id,
+            start=reference_time,
+            hours_ahead=24.0,
+            steps=120,
+        )
+        if tca_event is None:
+            return None
+
+        exact_tca = _parse_datetime(tca_event.tca_utc)
+        if exact_tca is None:
+            return None
+
+        state_a = propagator.propagate_one(node_a.norad_id, exact_tca)
+        state_b = propagator.propagate_one(node_b.norad_id, exact_tca)
+        if state_a is None or state_b is None or state_a.error_code != 0 or state_b.error_code != 0:
+            return None
+
+        pos_a = np.array([state_a.x, state_a.y, state_a.z], dtype=float)
+        pos_b = np.array([state_b.x, state_b.y, state_b.z], dtype=float)
+        vel_a = np.array([state_a.vx, state_a.vy, state_a.vz], dtype=float)
+        vel_b = np.array([state_b.vx, state_b.vy, state_b.vz], dtype=float)
+
+        miss_distance_km = _norm(pos_a - pos_b)
+        relative_velocity_kms = _norm(vel_a - vel_b)
+        tca_minutes = max(0.0, (exact_tca - reference_time).total_seconds() / 60.0)
+        p_collision = self.risk_model.score({
+            "miss_distance_km": miss_distance_km,
+            "relative_speed_kmh": relative_velocity_kms * 3600.0,
+            "sat1_altitude_km": node_a.altitude_km,
+            "sat2_altitude_km": node_b.altitude_km,
+            "tca_minutes": tca_minutes,
+        })
+        cpi_score = self._compute_cpi(miss_distance_km, relative_velocity_kms, tca_minutes, p_collision)
+        hotspot_score = self._compute_hotspot_score(cpi_score, p_collision, miss_distance_km, tca_minutes)
+
+        return {
+            "miss_distance_km": round(float(miss_distance_km), 3),
+            "predicted_miss_distance_km": round(float(miss_distance_km), 3),
+            "relative_velocity_kmh": round(float(relative_velocity_kms * 3600.0), 2),
+            "tca_minutes": round(float(tca_minutes), 2),
+            "tca_utc": exact_tca.isoformat(),
+            "p_collision": round(float(p_collision), 4),
+            "cpi_score": round(float(cpi_score), 2),
+            "hotspot_score": round(float(hotspot_score), 3),
+            "hotspot_position": {
+                "x": round(float((pos_a[0] + pos_b[0]) / 2.0), 3),
+                "y": round(float((pos_a[1] + pos_b[1]) / 2.0), 3),
+                "z": round(float((pos_a[2] + pos_b[2]) / 2.0), 3),
+            },
+        }

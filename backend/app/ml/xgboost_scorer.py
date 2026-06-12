@@ -1,11 +1,28 @@
+"""
+xgboost_scorer.py — Collision risk scorer backed by a Foster-trained XGBoost model.
+
+On module import, attempts to load a previously trained model from
+risk_model_trained.json. If not found, triggers training via train_xgboost.py
+(which generates Foster B-plane data and trains XGBoost — ~1–3 min first run).
+
+Falls back to the legacy boosted-stump heuristic if XGBoost is unavailable.
+
+Usage:
+    from app.ml.xgboost_scorer import XGBoostScorer
+    scorer = XGBoostScorer()
+    risk = scorer.score(conjunction_event_dict)  # returns float 0–1
+"""
+
 from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
 try:
     import joblib
     import xgboost as xgb
@@ -16,12 +33,35 @@ except Exception:
 from .artifacts import load_artifact, save_artifact
 from .synthetic_data import generate_risk_dataset, sigmoid
 
-
 logger = logging.getLogger(__name__)
 
 RISK_ARTIFACT = "risk_model.json"
 RISK_ARTIFACT_JOBLIB = "risk_model.joblib"
 
+# ── Module-level trained model (loaded once on import) ────────────────────────
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRAINED_MODEL_PATH = os.path.join(_MODULE_DIR, "risk_model_trained.json")
+
+_trained_model = None
+_using_trained = False
+
+if xgb is not None:
+    try:
+        from app.ml.train_xgboost import load_or_train as _load_or_train
+        _trained_model = _load_or_train(_TRAINED_MODEL_PATH)
+        _using_trained = True
+        print("XGBoost: loaded trained Foster model")
+        logger.info("XGBoost risk model loaded from %s", _TRAINED_MODEL_PATH)
+    except Exception as _xgb_init_err:
+        _trained_model = None
+        _using_trained = False
+        print(f"XGBoost: falling back to heuristic ({_xgb_init_err})")
+        logger.warning("XGBoost model load/train failed: %s", _xgb_init_err)
+else:
+    print("XGBoost: library not installed — using heuristic fallback")
+
+
+# ── Legacy boosted-stump model (fallback) ─────────────────────────────────────
 
 @dataclass
 class DecisionStump:
@@ -173,17 +213,15 @@ def train_risk_model(
 
 
 def load_or_train_risk_model(retrain: bool = False) -> BoostedRiskModel:
-    # Prefer a real XGBoost artifact if available
     from .artifacts import artifact_path
 
     if not retrain:
-        # Try joblib xgboost model first
         try:
             if joblib is not None:
                 path = artifact_path(RISK_ARTIFACT_JOBLIB)
                 if path.exists():
                     clf = joblib.load(path)
-                    # Wrap sklearn/xgboost model in a simple adapter
+
                     class XGBWrapper:
                         def __init__(self, model):
                             self.model = model
@@ -205,12 +243,6 @@ def load_or_train_risk_model(retrain: bool = False) -> BoostedRiskModel:
 
 
 def _wrap_xgb_as_boosted(xgb_model, feature_names: list[str] | None = None) -> BoostedRiskModel:
-    """
-    Create a minimal BoostedRiskModel-like adapter from a trained sklearn/xgboost
-    estimator that implements `predict_proba`. This keeps the rest of the code
-    compatible with the existing `BoostedRiskModel` interface.
-    """
-    # We create a single-stump passthrough that returns the model probability
     class Wrapped:
         def __init__(self, model):
             self.model = model
@@ -226,47 +258,52 @@ def _wrap_xgb_as_boosted(xgb_model, feature_names: list[str] | None = None) -> B
                 mat = mat.reshape(1, -1)
             return self.model.predict_proba(mat)[:, 1].astype(float)
 
-    # Create a dummy BoostedRiskModel wrapper using the Wrapped estimator
     wrapper = Wrapped(xgb_model)
-
-    # Build a minimal BoostedRiskModel that proxies to wrapper
     adapter = BoostedRiskModel(base_logit=0.0, learning_rate=1.0, stumps=[], feature_names=feature_names or [])
-
-    # Monkey-patch predict methods to call wrapped model
     adapter.predict_row = wrapper.predict_row  # type: ignore
     adapter.predict_batch = wrapper.predict_batch  # type: ignore
     return adapter
 
 
 def train_xgboost_model(sample_count: int = 16384, seed: int = 7) -> str:
-    """Train a real XGBoost classifier on synthetic data and save as joblib.
-    Returns path to saved model or raises on failure.
-    """
+    """Train a real XGBoost classifier on synthetic data and save as joblib."""
     if xgb is None or joblib is None:
         raise RuntimeError("xgboost or joblib not installed")
 
     features, targets, feature_names = generate_risk_dataset(sample_count=sample_count, seed=seed)
-
-    # Convert probabilistic targets to binary labels using 0.5 threshold for classifier
     labels = (targets >= 0.5).astype(int)
 
     clf = xgb.XGBClassifier(use_label_encoder=False, eval_metric="logloss", random_state=seed, n_estimators=200)
     clf.fit(features, labels)
 
     from .artifacts import artifact_path
-
     out_path = artifact_path(RISK_ARTIFACT_JOBLIB)
     joblib.dump(clf, out_path)
     logger.info("Trained and saved XGBoost model to %s", out_path)
     return str(out_path)
 
 
+# ── XGBoostScorer public class ────────────────────────────────────────────────
+
 class XGBoostScorer:
     """
     Tabular collision-risk scorer.
-    The implementation is a compact boosted-stump model trained on synthetic
-    conjunction data so the runtime stays lightweight and deterministic.
+
+    Primary path: Foster-trained XGBoost model loaded from risk_model_trained.json.
+    Fallback: compact boosted-stump heuristic (legacy) when XGBoost unavailable.
     """
+
+    # Feature keys expected for the trained Foster model (8 features)
+    TRAINED_FEATURE_KEYS = [
+        "miss_distance_km",
+        "relative_velocity_kms",
+        "tca_hours",
+        "tle_age_hours",
+        "altitude_km",
+        "c_radial",
+        "c_transverse",
+        "c_normal",
+    ]
 
     def __init__(self, model_path: str = None):
         self.model: BoostedRiskModel | None = None
@@ -305,10 +342,63 @@ class XGBoostScorer:
             float(event.get("uncertainty_km", 0.0)),
         ]
 
+    def extract_trained_features(self, event: dict[str, Any]) -> np.ndarray:
+        """Extract the 8-feature vector required by the Foster-trained model."""
+        miss_km = float(event.get("miss_distance_km", 1.0))
+        rel_vel_kmh = float(event.get("relative_speed_kmh", 27000.0))
+        rel_vel_kms = rel_vel_kmh / 3600.0
+
+        alt1 = float(event.get("sat1_altitude_km", 400.0))
+        alt2 = float(event.get("sat2_altitude_km", 400.0))
+        altitude_km = (alt1 + alt2) / 2.0
+
+        tca_hours = float(event.get("tca_hours", event.get("tca_minutes", 720.0) / 60.0))
+        tle_age_hours = float(event.get("tle_age_hours", 6.0))
+
+        # Covariance features — use defaults if not available
+        cov_ellipse = event.get("covariance_ellipse") or {}
+        c_radial = float(event.get("c_radial", 0.0025))
+        c_transverse = float(event.get("c_transverse",
+            (cov_ellipse.get("a", 3000.0) / 1000.0 / 3.0) ** 2
+        ))
+        c_normal = (c_radial + c_transverse) / 2.0
+
+        return np.array([
+            miss_km,
+            rel_vel_kms,
+            tca_hours,
+            tle_age_hours,
+            altitude_km,
+            c_radial,
+            c_transverse,
+            c_normal,
+        ], dtype=float)
+
     def score(self, features: dict | list[float] | np.ndarray) -> float:
         """
         Score collision risk from 0.0 (safe) to 1.0 (critical).
+
+        Primary path: Foster-trained XGBoost model.
+        Fallback: legacy boosted-stump heuristic.
         """
+        # ── Primary path: Foster-trained XGBoost ──────────────────────────
+        if _using_trained and _trained_model is not None and xgb is not None:
+            try:
+                if isinstance(features, dict):
+                    feature_array = self.extract_trained_features(features).reshape(1, -1)
+                else:
+                    feature_array = np.asarray(features, dtype=float).reshape(1, -1)
+
+                dmatrix = xgb.DMatrix(feature_array, feature_names=None)
+                score_val = float(_trained_model.predict(dmatrix)[0])
+                return float(np.clip(score_val, 0.0, 1.0))
+            except Exception as trained_err:
+                logger.warning(
+                    "Trained XGBoost scorer failed: %s — using heuristic fallback",
+                    trained_err,
+                )
+
+        # ── Fallback: legacy boosted-stump heuristic ───────────────────────
         if self.model is None:
             self._load_or_train_model(self.model_path)
 

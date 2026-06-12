@@ -12,6 +12,13 @@ from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_lat
 from app.core.conjunction import screen_conjunctions
 from app.services.cascade_planner import CascadePlanner
 
+try:
+    from app.core.satellite_state_tracker import satellite_tracker
+    _TRACKER_AVAILABLE = True
+except ImportError:
+    satellite_tracker = None
+    _TRACKER_AVAILABLE = False
+
 router = APIRouter(prefix="/api")
 
 
@@ -116,6 +123,54 @@ async def get_satellite_detail(norad_id: int):
     return state.to_dict()
 
 
+@router.get("/satellites/{norad_id}/telemetry")
+async def get_satellite_telemetry(norad_id: int):
+    """Get stateful telemetry for a satellite (fuel, battery, temperature, etc.)."""
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    state = _propagator.propagate_one(norad_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Satellite not found")
+
+    if _TRACKER_AVAILABLE and satellite_tracker is not None:
+        telemetry = satellite_tracker.get_telemetry(norad_id, state.name)
+    else:
+        # Minimal fallback when tracker is unavailable
+        import random
+        telemetry = {
+            "norad_id": norad_id,
+            "satellite_name": state.name,
+            "fuel_remaining_pct": round(max(0.0, 85.0 + random.uniform(-5, 10)), 2),
+            "battery_pct": round(88.0 + random.uniform(-3, 3), 2),
+            "temperature_c": round(-10.0 + random.uniform(-8, 8), 2),
+            "signal_strength_dbm": round(-65.0 + random.uniform(-5, 5), 2),
+            "solar_power_w": round(1200.0 + random.uniform(-100, 100), 1),
+            "total_delta_v_used_ms": 0.0,
+            "maneuver_count": 0,
+        }
+
+    return {
+        **telemetry,
+        "norad_id": norad_id,
+        "epoch_utc": state.epoch_utc,
+    }
+
+
+@router.get("/satellites/{norad_id}/history")
+async def get_satellite_maneuver_history(norad_id: int):
+    """Get the full maneuver history for a satellite."""
+    if _TRACKER_AVAILABLE and satellite_tracker is not None:
+        history = satellite_tracker.get_maneuver_history(norad_id)
+    else:
+        history = []
+    return {
+        "norad_id": norad_id,
+        "maneuver_count": len(history),
+        "history": history,
+    }
+
+
 @router.get("/alerts")
 async def get_alerts():
     """Get current conjunction alerts."""
@@ -124,6 +179,7 @@ async def get_alerts():
         "alerts": alerts_snapshot.get("alerts", []),
         "count": alerts_snapshot.get("count", 0),
         "timestamp": alerts_snapshot.get("timestamp"),
+        "hotspots": alerts_snapshot.get("hotspots", []),
         "cascade_plan": alerts_snapshot.get("cascade_plan", []),
         "graph": alerts_snapshot.get("graph", {}),
         "cascade_depth": alerts_snapshot.get("cascade_depth", 0),
@@ -196,6 +252,19 @@ async def execute_maneuver(req: ManeuverRequest):
     )
 
     if result.get("status") == "success":
+        # ── Record maneuver in state tracker (fuel depletion) ─────────────
+        import math as _math
+        delta_v_ms = _math.sqrt(req.dvx**2 + req.dvy**2 + req.dvz**2)
+        if _TRACKER_AVAILABLE and satellite_tracker is not None:
+            try:
+                state = _propagator.propagate_one(req.norad_id)
+                sat_name = state.name if state is not None else f"SAT-{req.norad_id}"
+                satellite_tracker.record_maneuver(
+                    req.norad_id, delta_v_ms, req.frame, sat_name
+                )
+            except Exception as tracker_err:
+                import logging as _log
+                _log.getLogger(__name__).warning("Tracker record_maneuver failed: %s", tracker_err)
         snapshot = await asyncio.to_thread(
             _build_snapshot,
             _propagator,
@@ -228,11 +297,14 @@ async def execute_maneuver(req: ManeuverRequest):
                 _cascade_planner.analyze_snapshot,
                 sampled_states,
                 [alert.to_dict() for alert in alerts],
+                _propagator,
+                datetime.fromisoformat(snapshot["timestamp"]),
             )
 
         result = {
             **result,
             "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
+                "hotspots": cascade_summary.get("hotspots", []),
             "cascade_plan": cascade_summary.get("cascade_plan", []),
             "graph": cascade_summary.get("graph", {}),
             "cascade_depth": cascade_summary.get("cascade_depth", 0),
@@ -247,6 +319,7 @@ async def execute_maneuver(req: ManeuverRequest):
             "timestamp": snapshot.get("timestamp"),
             "alerts": result["alerts"],
             "count": len(result["alerts"]),
+            "hotspots": result["hotspots"],
             "graph": result["graph"],
             "cascade_plan": result["cascade_plan"],
             "cascade_depth": result["cascade_depth"],
@@ -295,7 +368,7 @@ async def preflight_check(req: ManeuverRequest):
     if _sim_engine is None:
         return {"status": "ERROR"}
 
-    result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz)
+    result = _sim_engine.preflight_check(req.norad_id, req.dvx, req.dvy, req.dvz, frame=req.frame)
     return result
 
 

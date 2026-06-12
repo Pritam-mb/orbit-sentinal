@@ -11,6 +11,7 @@ const useStore = create((set, get) => ({
   // Conjunction alerts
   alerts: [],
   cascadePlan: null,
+  hotspots: [],
 
   // Maneuver controls
   maneuver: { dvx: 0, dvy: 0, dvz: 0 },
@@ -43,6 +44,8 @@ const useStore = create((set, get) => ({
   setAlerts: (alerts) => set({ alerts }),
 
   setCascadePlan: (cascadePlan) => set({ cascadePlan }),
+
+  setHotspots: (hotspots) => set({ hotspots }),
 
   setManeuver: (axis, value) =>
     set((state) => ({

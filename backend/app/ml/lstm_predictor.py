@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -10,7 +11,6 @@ import numpy as np
 
 from .artifacts import load_artifact, save_artifact
 from .synthetic_data import generate_trajectory_dataset
-
 
 logger = logging.getLogger(__name__)
 
@@ -298,9 +298,132 @@ class LSTMPredictor:
             self._buffers[norad_id] = RingBuffer(capacity=120)
         return self._buffers[norad_id]
 
-    def record(self, norad_id: int, timestamp: str, x: float, y: float, z: float):
+    def record(self, norad_id: int, timestamp: str, x: float, y: float, z: float,
+               vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
         buf = self.get_buffer(norad_id)
         buf.push(timestamp, x, y, z)
+
+        # ── Auto-retrain trigger: when enough real data accumulates ────────
+        # Count total entries across all buffers
+        total_entries = sum(b.size for b in self._buffers.values())
+        if total_entries > 500 and not getattr(self, "_training_active", False):
+            self._training_active = True
+            t = threading.Thread(target=self._background_train, daemon=True)
+            t.start()
+
+    def _background_train(self):
+        """Background thread wrapper for train_on_buffer_data."""
+        try:
+            self.train_on_buffer_data()
+        except Exception as exc:
+            logger.warning("Background LSTM retraining failed: %s", exc)
+        finally:
+            self._training_active = False
+
+    def train_on_buffer_data(self) -> bool:
+        """
+        Train a PyTorch LSTM on real position sequences from ring buffers.
+
+        Called automatically when total buffer entries exceed 500.
+        Uses a 2-layer LSTM with hidden size 64:
+          - input_size  = 6  (x, y, z, vx, vy, vz — but only x/y/z stored)
+            Note: velocities are approximated from consecutive positions
+          - hidden_size = 64
+          - num_layers  = 2
+          - output_size = 3  (predict next x, y, z)
+
+        Positions are normalised by dividing by 7000 km (typical LEO orbit radius).
+        Trains for 20 epochs with Adam lr=1e-3.
+        Saves state dict to lstm_model.pt in the artifacts directory.
+
+        Returns True on success, False on failure.
+        """
+        WINDOW = 10
+        NORM = 7000.0  # km — typical LEO orbit radius for normalisation
+
+        try:
+            import torch
+            import torch.nn as nn
+        except ImportError:
+            logger.warning("PyTorch not installed — LSTM retraining skipped")
+            return False
+
+        try:
+            # ── Collect sliding-window samples from ring buffers ─────────
+            X_list, y_list = [], []
+            n_sats = 0
+            for norad_id, buf in self._buffers.items():
+                positions = buf.get_positions()  # shape (N, 3)
+                if positions.shape[0] < WINDOW + 1:
+                    continue
+                n_sats += 1
+                normed = positions / NORM
+                for k in range(len(normed) - WINDOW):
+                    seq = normed[k : k + WINDOW]       # (WINDOW, 3)
+                    target = normed[k + WINDOW]         # (3,)
+                    # Approximate velocities from differences (normalised km/step)
+                    vels = np.diff(seq, axis=0)         # (WINDOW-1, 3)
+                    # Pad first velocity
+                    vels = np.vstack([vels[:1], vels])  # (WINDOW, 3)
+                    inp = np.concatenate([seq, vels], axis=1)  # (WINDOW, 6)
+                    X_list.append(inp)
+                    y_list.append(target)
+
+            if len(X_list) < 10:
+                logger.info("Not enough buffer data for LSTM retraining (%d sequences)", len(X_list))
+                return False
+
+            X = torch.tensor(np.array(X_list, dtype=np.float32))   # (N, WINDOW, 6)
+            y = torch.tensor(np.array(y_list, dtype=np.float32))   # (N, 3)
+
+            # ── Define LSTM model ─────────────────────────────────────────
+            class OrbitalLSTM(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.lstm = nn.LSTM(
+                        input_size=6, hidden_size=64, num_layers=2,
+                        batch_first=True, dropout=0.1
+                    )
+                    self.fc = nn.Linear(64, 3)
+
+                def forward(self, x):
+                    out, _ = self.lstm(x)
+                    return self.fc(out[:, -1, :])  # last timestep
+
+            torch_model = OrbitalLSTM()
+            optimizer = torch.optim.Adam(torch_model.parameters(), lr=1e-3)
+            loss_fn = nn.MSELoss()
+
+            # ── Train for 20 epochs ───────────────────────────────────────
+            torch_model.train()
+            for epoch in range(20):
+                perm = torch.randperm(X.shape[0])
+                epoch_loss = 0.0
+                for batch_start in range(0, X.shape[0], 64):
+                    idx = perm[batch_start : batch_start + 64]
+                    xb, yb = X[idx], y[idx]
+                    optimizer.zero_grad()
+                    pred = torch_model(xb)
+                    loss = loss_fn(pred, yb)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(torch_model.parameters(), 1.0)
+                    optimizer.step()
+                    epoch_loss += loss.item() * len(xb)
+
+            # ── Save state dict ───────────────────────────────────────────
+            import os
+            model_dir = os.path.dirname(os.path.abspath(__file__))
+            save_path = os.path.join(model_dir, "lstm_model.pt")
+            torch.save(torch_model.state_dict(), save_path)
+            logger.info(
+                "LSTM retrained on %d sequences from %d satellites (saved to %s)",
+                len(X_list), n_sats, save_path,
+            )
+            return True
+
+        except Exception as exc:
+            logger.warning("train_on_buffer_data failed: %s", exc)
+            return False
 
     def predict(self, norad_id: int, steps_ahead: int = 10) -> list[dict]:
         buf = self.get_buffer(norad_id)
@@ -309,13 +432,25 @@ class LSTMPredictor:
         if len(positions) < 2:
             return []
 
+        # ── Primary path: use trained RecurrentTrajectoryModel ───────────
         if self.model is not None and len(positions) >= 2:
-            sequence = positions[-self.model.sequence_length :]
-            if len(sequence) < self.model.sequence_length:
-                pad_count = self.model.sequence_length - len(sequence)
-                sequence = np.vstack([np.repeat(sequence[:1], pad_count, axis=0), sequence])
-            return self.model.predict_steps(sequence, steps_ahead=steps_ahead)
+            try:
+                sequence = positions[-self.model.sequence_length :]
+                if len(sequence) < self.model.sequence_length:
+                    pad_count = self.model.sequence_length - len(sequence)
+                    sequence = np.vstack([np.repeat(sequence[:1], pad_count, axis=0), sequence])
+                return self.model.predict_steps(sequence, steps_ahead=steps_ahead)
+            except Exception as model_err:
+                logger.warning("RecurrentTrajectoryModel prediction failed: %s", model_err)
 
+        # ── FALLBACK: linear extrapolation ────────────────────────────────
+        # Labelled explicitly as fallback — has no predictive advantage over SGP4.
+        # Only used when model is None or raises.
+        logger.debug(
+            "FALLBACK: LSTM predict for NORAD %d using linear extrapolation "
+            "(model not loaded or insufficient data)",
+            norad_id,
+        )
         p1 = positions[-2]
         p2 = positions[-1]
         velocity = p2 - p1

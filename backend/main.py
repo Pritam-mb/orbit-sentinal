@@ -20,7 +20,7 @@ from app.core.state_cache import (
     set_latest_snapshot,
     get_all_kalman_states,
 )
-from app.data.tle_fetcher import load_local_tles
+from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
 from app.services.cascade_planner import CascadePlanner
 from app.api.ws_handler import ConnectionManager, satellite_broadcast_loop
@@ -141,12 +141,15 @@ async def refresh_alerts_loop():
                     cascade_planner.analyze_snapshot,
                     sampled_states,
                     [alert.to_dict() for alert in alerts],
+                    propagator,
+                    snapshot.get("timestamp") and datetime.fromisoformat(snapshot["timestamp"]),
                 )
 
             set_latest_alerts({
                 "timestamp": snapshot.get("timestamp"),
                 "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
                 "count": len(alerts),
+                "hotspots": cascade_summary.get("hotspots", []),
                 "graph": cascade_summary.get("graph", {}),
                 "cascade_plan": cascade_summary.get("cascade_plan", []),
                 "cascade_depth": cascade_summary.get("cascade_depth", 0),
@@ -169,14 +172,58 @@ async def lifespan(app: FastAPI):
     """Startup: fetch TLEs and begin broadcast loop."""
     logger.info("=== Orbital Sentinel starting ===")
 
-    # Load the bundled snapshot immediately so the API starts fast.
-    local_tles = load_local_tles(max_sats=0)
-    propagator.load_tles(local_tles)
-    logger.info(f"Tracking {propagator.satellite_count} satellites from local snapshot")
+    # ── Model initialization sequence ─────────────────────────────────────────
+    print("=== Orbital Sentinel Startup ===")
+
+    print("Initializing Foster B-plane physics engine...")
+    try:
+        from app.core import analytics as _analytics_module  # noqa: F401
+        print("  Foster B-plane analytics ready")
+    except Exception as _analytics_err:
+        print(f"  WARNING: analytics.py failed to load: {_analytics_err}")
+
+    print("Initializing satellite state tracker...")
+    try:
+        from app.core.satellite_state_tracker import satellite_tracker as _tracker
+        print(f"  State tracker ready (tracking 0 satellites at startup)")
+    except Exception as _tracker_err:
+        print(f"  WARNING: satellite_state_tracker failed: {_tracker_err}")
+
+    print("Initializing agency authority model...")
+    try:
+        from app.core.agency_authority import authority_manager as _auth
+        # Create default sessions for each known agency
+        for _agency in [
+            "SpaceX", "ESA", "ISRO", "ROSCOSMOS",
+            "ISS/NASA", "CNSA", "US Space Force",
+            "NOAA", "NASA",
+        ]:
+            _auth.create_session(_agency)
+        print(f"  Authority model ready with {len(_auth.sessions)} sessions (DEMO_SESSION + {len(_auth.sessions)-1} agency sessions)")
+    except Exception as _auth_err:
+        print(f"  WARNING: agency_authority failed: {_auth_err}")
+
+    print("Initializing XGBoost risk classifier (may train on first run — ~1-3 min)...")
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: __import__("app.ml.xgboost_scorer", fromlist=["_trained_model"]),
+        )
+        print("  XGBoost risk classifier ready")
+    except Exception as _xgb_err:
+        print(f"  WARNING: XGBoost init failed: {_xgb_err}")
+
+    print("=== Model initialization complete ===")
+
+    # Load live TLEs when Space-Track credentials are configured, otherwise fall back.
+    tles = await fetch_tles(max_sats=0)
+    propagator.load_tles(tles)
+    logger.info(f"Tracking {propagator.satellite_count} satellites from current TLE source")
 
     now = datetime.now(timezone.utc)
     set_latest_snapshot(await asyncio.to_thread(build_snapshot, propagator, now))
-    set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0})
+    set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0, "hotspots": []})
 
     # Initialize REST routes with shared instances
     init_routes(propagator, sim_engine)

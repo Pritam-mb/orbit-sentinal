@@ -2,9 +2,13 @@ fastapi
 uvicorn[standard]
 sgp4
 numpy
+scipy
 filterpy
 python-dotenv
 httpx
-scipy
 joblib
 xgboost
+scikit-learn
+pandas
+torch
+websockets

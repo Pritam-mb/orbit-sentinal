@@ -4,6 +4,7 @@ import useStore from '../../store/useStore';
 const AlertPanel = () => {
   const alerts = useStore((s) => s.alerts);
   const cascadePlan = useStore((s) => s.cascadePlan);
+  const hotspots = useStore((s) => s.hotspots);
 
   const totalDeltaV = cascadePlan?.total_delta_v_ms != null
     ? Number(cascadePlan.total_delta_v_ms).toFixed(3)
@@ -91,6 +92,22 @@ const AlertPanel = () => {
               <span>{maneuver.satellite_name}</span>
               <span className="mono">
                 D{maneuver.cascade_depth} | {maneuver.maneuver.delta_v_ms} m/s
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {hotspots.length > 0 && (
+        <div className="monitor-card" style={{ marginTop: 12 }}>
+          <div className="monitor-title">Red Hotspots</div>
+          {hotspots.slice(0, 5).map((hotspot, index) => (
+            <div className="monitor-row" key={`${hotspot.sat1?.id}-${hotspot.sat2?.id}-${index}`}>
+              <span>
+                {hotspot.sat1?.name || 'SAT-1'} × {hotspot.sat2?.name || 'SAT-2'}
+              </span>
+              <span className="mono">
+                {Number(hotspot.hotspot_score || 0).toFixed(2)} | T{Number(hotspot.tca_minutes || 0).toFixed(0)}m
               </span>
             </div>
           ))}

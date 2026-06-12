@@ -76,6 +76,25 @@ const PreflightModal = ({ noradId, maneuver, onConfirm, onCancel }) => {
           </span>
         </div>
 
+        {preflight?.trajectory && (
+          <div style={{ marginBottom: 12, fontSize: 11, color: 'var(--text-dim)' }}>
+            <div>
+              Nearest miss: <span className="mono" style={{ color: 'var(--text-bright)' }}>
+                {preflight.trajectory.min_miss_distance_km != null
+                  ? `${Number(preflight.trajectory.min_miss_distance_km).toFixed(2)} km`
+                  : '—'}
+              </span>
+            </div>
+            <div>
+              Closest TCA: <span className="mono" style={{ color: 'var(--text-bright)' }}>
+                {preflight.trajectory.closest_tca_minutes != null
+                  ? `${Number(preflight.trajectory.closest_tca_minutes).toFixed(1)} min`
+                  : '—'}
+              </span>
+            </div>
+          </div>
+        )}
+
         {preflight?.gates &&
           Object.entries(preflight.gates).map(([key, passed]) => (
             <div className="gate-item" key={key}>
