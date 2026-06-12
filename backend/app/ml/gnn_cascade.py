@@ -178,13 +178,13 @@ class CascadeGNN:
             }
 
         if self.model is not None:
-            maneuver_probability = self.model.predict_probability(summary_features)
+            maneuver_probability = self.model.predict_probability(summary_features).reshape(-1)
         else:
             local_risk = summary_features[:, 4]
             influence = summary_features[:, 9]
             altitude_term = 1.0 - np.clip(summary_features[:, 2], 0.0, 1.0)
             logits = (1.2 * influence) + (0.4 * local_risk) + (0.15 * altitude_term)
-            maneuver_probability = sigmoid(logits - 0.75)
+            maneuver_probability = sigmoid(logits - 0.75).reshape(-1)
 
         influence = summary_features[:, 9]
         local_risk = summary_features[:, 4]
@@ -202,7 +202,7 @@ class CascadeGNN:
         delta_v[:, 2] = np.clip((influence - 0.35) * 0.22, -1.0, 1.0)
 
         return {
-            "maneuver_probability": maneuver_probability,
+            "maneuver_probability": np.asarray(maneuver_probability, dtype=float).reshape(-1),
             "delta_v_rsw_ms": delta_v,
             "cascade_depth": cascade_depth,
             "graph_influence": influence,

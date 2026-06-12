@@ -24,6 +24,7 @@ _latest_alerts: dict[str, Any] = {
     "cascade_depth": 0,
     "total_delta_v_ms": 0.0,
     "agencies_involved": [],
+    "debris_clouds": [],
 }
 
 _kalman_states: dict[int, dict[str, Any]] = {}  # norad_id -> Kalman state dict

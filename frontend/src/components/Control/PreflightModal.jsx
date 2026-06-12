@@ -10,7 +10,7 @@ const GATE_LABELS = {
 };
 
 const PreflightModal = ({ noradId, maneuver, onConfirm, onCancel }) => {
-  const apiBaseUrl = 'http://127.0.0.1:8000';
+  const apiBaseUrl = '';
   const [preflight, setPreflight] = useState(null);
   const [loading, setLoading] = useState(true);
 

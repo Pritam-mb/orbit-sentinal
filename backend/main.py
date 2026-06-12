@@ -6,6 +6,7 @@ Initializes propagator, sim engine, WebSocket broadcast, and REST routes.
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -23,9 +24,12 @@ from app.core.state_cache import (
 from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
 from app.services.cascade_planner import CascadePlanner
+from app.services.debris_model import build_debris_alerts
 from app.api.ws_handler import ConnectionManager, satellite_broadcast_loop
 from app.api.routes import router, init_routes
 from app.routers.test_mode import router as test_mode_router, init_test_mode
+from app.ml.runtime import get_ml_runtime
+from app.streaming.kafka_adapter import KafkaAdapter
 
 load_dotenv(dotenv_path="../.env")
 
@@ -37,6 +41,14 @@ propagator = SGP4Propagator()
 sim_engine = SimEngine(propagator)
 ws_manager = ConnectionManager()
 cascade_planner = CascadePlanner()
+ml_runtime = get_ml_runtime()
+USE_APSCHEDULER = os.getenv("USE_APSCHEDULER", "0") == "1"
+SNAPSHOT_REFRESH_SECONDS = float(os.getenv("SNAPSHOT_REFRESH_SECONDS", "1"))
+ALERT_REFRESH_SECONDS = float(os.getenv("ALERT_REFRESH_SECONDS", "30"))
+ENABLE_EXTENDED_PIPELINE = os.getenv("ENABLE_EXTENDED_PIPELINE", "0") == "1"
+
+ml_runtime = get_ml_runtime() if ENABLE_EXTENDED_PIPELINE else None
+kafka_adapter = KafkaAdapter() if ENABLE_EXTENDED_PIPELINE else None
 
 
 def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
@@ -93,59 +105,80 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
     return snapshot
 
 
+async def refresh_snapshot_once():
+    try:
+        now = datetime.now(timezone.utc)
+        snapshot = await asyncio.to_thread(build_snapshot, propagator, now)
+        set_latest_snapshot(snapshot)
+        if ENABLE_EXTENDED_PIPELINE and ml_runtime is not None and snapshot.get("states"):
+            ml_runtime.record_snapshot(snapshot.get("states", []), now)
+        payload = snapshot.get("payload")
+        if ENABLE_EXTENDED_PIPELINE and kafka_adapter is not None and payload:
+            kafka_adapter.publish_snapshot(payload)
+    except Exception as error:
+        logger.error(f"Snapshot refresh error: {error}")
+
+
 async def refresh_snapshot_loop():
     """Keep the latest propagated satellite snapshot warm in memory."""
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            snapshot = await asyncio.to_thread(build_snapshot, propagator, now)
-            set_latest_snapshot(snapshot)
+            await refresh_snapshot_once()
         except asyncio.CancelledError:
             raise
-        except Exception as error:
-            logger.error(f"Snapshot refresh error: {error}")
-
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(SNAPSHOT_REFRESH_SECONDS)
 
 
-async def refresh_alerts_loop():
+async def refresh_alerts_once():
     """Refresh conjunction alerts at a slower cadence to avoid blocking startup."""
+    if not ENABLE_EXTENDED_PIPELINE:
+        return
+
     max_alert_states = 250
-    while True:
-        try:
-            snapshot = get_latest_snapshot()
-            states = snapshot.get("states", [])
-            alerts = []
-            cascade_summary = {
-                "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
-                "alerts": [],
-                "cascade_plan": [],
-                "total_delta_v_ms": 0.0,
-                "cascade_depth": 0,
-                "agencies_involved": [],
-                "seed_satellites": [],
-                "cpi_threshold": 5.0,
-                "node_probabilities": {},
-            }
+    try:
+        snapshot = get_latest_snapshot()
+        states = snapshot.get("states", [])
+        alerts = []
+        sampled_states = []
+        cascade_summary = {
+            "graph": {"node_count": 0, "edge_count": 0, "influence_radius_km": 200.0},
+            "alerts": [],
+            "cascade_plan": [],
+            "total_delta_v_ms": 0.0,
+            "cascade_depth": 0,
+            "agencies_involved": [],
+            "seed_satellites": [],
+            "cpi_threshold": 5.0,
+            "node_probabilities": {},
+        }
 
-            if states:
-                if len(states) > max_alert_states:
-                    step = max(1, len(states) // max_alert_states)
-                    sampled_states = states[::step][:max_alert_states]
-                else:
-                    sampled_states = states
+        if states:
+            if len(states) > max_alert_states:
+                step = max(1, len(states) // max_alert_states)
+                sampled_states = states[::step][:max_alert_states]
+            else:
+                sampled_states = states
 
-                kalman_states = get_all_kalman_states()
-                alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
-                cascade_summary = await asyncio.to_thread(
-                    cascade_planner.analyze_snapshot,
-                    sampled_states,
-                    [alert.to_dict() for alert in alerts],
-                    propagator,
-                    snapshot.get("timestamp") and datetime.fromisoformat(snapshot["timestamp"]),
-                )
+            kalman_states = get_all_kalman_states()
+            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
+            cascade_summary = await asyncio.to_thread(
+                cascade_planner.analyze_snapshot,
+                sampled_states,
+                [alert.to_dict() for alert in alerts],
+                propagator,
+                snapshot.get("timestamp") and datetime.fromisoformat(snapshot["timestamp"]),
+            )
 
-            set_latest_alerts({
+            debris_clouds = build_debris_alerts(
+                cascade_summary.get("hotspots", []),
+                sampled_states if states else [],
+                snapshot.get("timestamp"),
+                alerts=cascade_summary.get("alerts", []),
+                cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
+            )
+
+            alerts_payload = {
+                "type": "alerts",
                 "timestamp": snapshot.get("timestamp"),
                 "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
                 "count": len(alerts),
@@ -158,13 +191,24 @@ async def refresh_alerts_loop():
                 "seed_satellites": cascade_summary.get("seed_satellites", []),
                 "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
                 "node_probabilities": cascade_summary.get("node_probabilities", {}),
-            })
+                "debris_clouds": debris_clouds,
+            }
+            set_latest_alerts(alerts_payload)
+            if kafka_adapter is not None:
+                kafka_adapter.publish_alerts(alerts_payload)
+            if ml_runtime is not None:
+                ml_runtime.log_risk_samples(alerts_payload.get("alerts", []))
+    except Exception as error:
+        logger.error(f"Alert refresh error: {error}")
+
+
+async def refresh_alerts_loop():
+    while True:
+        try:
+            await refresh_alerts_once()
         except asyncio.CancelledError:
             raise
-        except Exception as error:
-            logger.error(f"Alert refresh error: {error}")
-
-        await asyncio.sleep(30.0)
+        await asyncio.sleep(ALERT_REFRESH_SECONDS)
 
 
 @asynccontextmanager
@@ -223,22 +267,45 @@ async def lifespan(app: FastAPI):
 
     now = datetime.now(timezone.utc)
     set_latest_snapshot(await asyncio.to_thread(build_snapshot, propagator, now))
-    set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0, "hotspots": []})
+    set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0, "hotspots": [], "debris_clouds": []})
 
     # Initialize REST routes with shared instances
     init_routes(propagator, sim_engine)
     init_test_mode(propagator)
 
-    # Start 1Hz broadcast background task
-    snapshot_task = asyncio.create_task(refresh_snapshot_loop())
-    alerts_task = asyncio.create_task(refresh_alerts_loop())
+    scheduler = None
+    snapshot_task = None
+    alerts_task = None
+    if USE_APSCHEDULER:
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+            scheduler = AsyncIOScheduler()
+            scheduler.add_job(refresh_snapshot_once, "interval", seconds=SNAPSHOT_REFRESH_SECONDS)
+            scheduler.add_job(refresh_alerts_once, "interval", seconds=ALERT_REFRESH_SECONDS)
+            if ENABLE_EXTENDED_PIPELINE and ml_runtime is not None:
+                shadow_hours = float(os.getenv("SHADOW_RETRAIN_HOURS", "6"))
+                scheduler.add_job(ml_runtime.shadow_retrain, "interval", hours=shadow_hours)
+            scheduler.start()
+            logger.info("APScheduler enabled for snapshot/alert refresh")
+        except Exception as error:
+            logger.warning("APScheduler unavailable, falling back to loops: %s", error)
+
+    if scheduler is None:
+        snapshot_task = asyncio.create_task(refresh_snapshot_loop())
+        alerts_task = asyncio.create_task(refresh_alerts_loop())
+
     broadcast_task = asyncio.create_task(satellite_broadcast_loop(ws_manager))
 
     yield
 
     # Shutdown
-    snapshot_task.cancel()
-    alerts_task.cancel()
+    if scheduler is not None:
+        scheduler.shutdown(wait=False)
+    if snapshot_task is not None:
+        snapshot_task.cancel()
+    if alerts_task is not None:
+        alerts_task.cancel()
     broadcast_task.cancel()
     logger.info("=== Orbital Sentinel stopped ===")
 
@@ -286,4 +353,5 @@ async def websocket_satellites(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    reload_enabled = os.getenv("UVICORN_RELOAD", "0") == "1"
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=reload_enabled)

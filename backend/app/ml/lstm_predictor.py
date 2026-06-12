@@ -467,3 +467,136 @@ class LSTMPredictor:
                 }
             )
         return predictions
+
+    def get_sequence(self, norad_id: int) -> np.ndarray | None:
+        buf = self.get_buffer(norad_id)
+        positions = buf.get_positions()
+        if self.model is None or len(positions) < 2:
+            return None
+
+        sequence = positions[-self.model.sequence_length :]
+        if len(sequence) < self.model.sequence_length:
+            pad_count = self.model.sequence_length - len(sequence)
+            sequence = np.vstack([np.repeat(sequence[:1], pad_count, axis=0), sequence])
+        return sequence
+
+    def predict_next_from_sequence(self, sequence: np.ndarray) -> np.ndarray | None:
+        if self.model is None:
+            return None
+        try:
+            return self.model.predict_next(sequence)
+        except Exception:
+            return None
+
+    def fine_tune(
+        self,
+        sequences: np.ndarray,
+        targets: np.ndarray,
+        epochs: int = 3,
+        learning_rate: float = 0.001,
+    ) -> float:
+        if self.model is None:
+            return 0.0
+
+        sequences = np.asarray(sequences, dtype=float)
+        targets = np.asarray(targets, dtype=float)
+        if sequences.ndim != 3 or targets.ndim != 2:
+            return 0.0
+
+        input_mean = self.model.input_mean
+        input_std = self.model.input_std
+        output_mean = self.model.output_mean
+        output_std = self.model.output_std
+
+        normalized_sequences = (sequences - input_mean) / input_std
+        normalized_targets = (targets - output_mean) / output_std
+
+        Wx = self.model.Wx
+        Wh = self.model.Wh
+        b = self.model.b
+        Wy = self.model.Wy
+        by = self.model.by
+
+        rng = np.random.default_rng(42)
+        last_loss = 0.0
+        for _ in range(epochs):
+            indices = rng.permutation(normalized_sequences.shape[0])
+            for idx in indices:
+                sequence = normalized_sequences[idx]
+                target = normalized_targets[idx]
+
+                hidden_states: list[np.ndarray] = []
+                previous_hidden = np.zeros(self.model.hidden_size, dtype=float)
+                for xt in sequence:
+                    pre = xt @ Wx + previous_hidden @ Wh + b
+                    hidden = np.tanh(pre)
+                    hidden_states.append(hidden)
+                    previous_hidden = hidden
+
+                predicted = hidden_states[-1] @ Wy + by
+                error = predicted - target
+                last_loss = float(np.mean(error**2))
+
+                grad_Wy = np.outer(hidden_states[-1], error)
+                grad_by = error
+                grad_Wx = np.zeros_like(Wx)
+                grad_Wh = np.zeros_like(Wh)
+                grad_b = np.zeros_like(b)
+
+                hidden_grad = error @ Wy.T
+                for step in reversed(range(sequence.shape[0])):
+                    hidden = hidden_states[step]
+                    previous = hidden_states[step - 1] if step > 0 else np.zeros(self.model.hidden_size, dtype=float)
+                    dz = hidden_grad * _tanh_derivative(hidden)
+                    grad_Wx += np.outer(sequence[step], dz)
+                    grad_Wh += np.outer(previous, dz)
+                    grad_b += dz
+                    hidden_grad = dz @ Wh.T
+
+                clip_value = 3.0
+                for grad in (grad_Wx, grad_Wh, grad_b, grad_Wy, grad_by):
+                    np.clip(grad, -clip_value, clip_value, out=grad)
+
+                Wx -= learning_rate * grad_Wx
+                Wh -= learning_rate * grad_Wh
+                b -= learning_rate * grad_b
+                Wy -= learning_rate * grad_Wy
+                by -= learning_rate * grad_by
+
+        self.model.Wx = Wx
+        self.model.Wh = Wh
+        self.model.b = b
+        self.model.Wy = Wy
+        self.model.by = by
+        return last_loss
+
+    def save_model(self):
+        if self.model is None:
+            return
+        save_artifact(
+            TRAJECTORY_ARTIFACT,
+            {
+                "trained_from": "shadow_mode_finetune",
+                "sample_count": 0,
+                "epochs": 0,
+                "stats": {},
+                "model": self.model.to_dict(),
+            },
+        )
+
+    def predict_next_from_buffer(self, norad_id: int) -> np.ndarray | None:
+        buf = self.get_buffer(norad_id)
+        positions = buf.get_positions()
+
+        if len(positions) < 2 or self.model is None:
+            return None
+
+        sequence = positions[-self.model.sequence_length :]
+        if len(sequence) < self.model.sequence_length:
+            pad_count = self.model.sequence_length - len(sequence)
+            sequence = np.vstack([np.repeat(sequence[:1], pad_count, axis=0), sequence])
+
+        try:
+            return self.model.predict_next(sequence)
+        except Exception:
+            return None

@@ -11,6 +11,9 @@ from pydantic import BaseModel
 from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot, get_all_kalman_states
 from app.core.conjunction import screen_conjunctions
 from app.services.cascade_planner import CascadePlanner
+from app.services.debris_model import build_debris_alerts
+from app.ml.runtime import get_ml_runtime
+from app.ml.model_metrics import get_model_metrics
 
 try:
     from app.core.satellite_state_tracker import satellite_tracker
@@ -188,7 +191,22 @@ async def get_alerts():
         "seed_satellites": alerts_snapshot.get("seed_satellites", []),
         "cpi_threshold": alerts_snapshot.get("cpi_threshold", 5.0),
         "node_probabilities": alerts_snapshot.get("node_probabilities", {}),
+        "debris_clouds": alerts_snapshot.get("debris_clouds", []),
     }
+
+
+@router.get("/anomalies")
+async def get_anomalies():
+    runtime = get_ml_runtime()
+    return {
+        "count": len(runtime.get_anomalies()),
+        "anomalies": runtime.get_anomalies(),
+    }
+
+
+@router.get("/model-metrics")
+async def get_model_metrics_endpoint():
+    return get_model_metrics()
 
 
 @router.get("/satellites/{norad_id}/orbit")
@@ -301,6 +319,14 @@ async def execute_maneuver(req: ManeuverRequest):
                 datetime.fromisoformat(snapshot["timestamp"]),
             )
 
+        debris_clouds = build_debris_alerts(
+            cascade_summary.get("hotspots", []),
+            sampled_states if sampled_states else [],
+            snapshot.get("timestamp"),
+            alerts=cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
+            cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
+        )
+
         result = {
             **result,
             "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
@@ -313,6 +339,7 @@ async def execute_maneuver(req: ManeuverRequest):
             "seed_satellites": cascade_summary.get("seed_satellites", []),
             "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
             "node_probabilities": cascade_summary.get("node_probabilities", {}),
+            "debris_clouds": debris_clouds,
         }
 
         set_latest_alerts({
@@ -328,6 +355,7 @@ async def execute_maneuver(req: ManeuverRequest):
             "seed_satellites": result["seed_satellites"],
             "cpi_threshold": result["cpi_threshold"],
             "node_probabilities": result["node_probabilities"],
+            "debris_clouds": result["debris_clouds"],
         })
 
     return result
@@ -443,6 +471,7 @@ async def judge_manipulate_satellite(req: JudgeManipulateRequest):
         "node_probabilities": {},
     }
     
+    sampled_states = []
     if states:
         if len(states) > 250:
             step = max(1, len(states) // 250)
@@ -457,6 +486,14 @@ async def judge_manipulate_satellite(req: JudgeManipulateRequest):
             sampled_states,
             [alert.to_dict() for alert in alerts],
         )
+
+    debris_clouds = build_debris_alerts(
+        cascade_summary.get("hotspots", []),
+        sampled_states if states else [],
+        snapshot.get("timestamp"),
+        alerts=cascade_summary.get("alerts", []),
+        cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
+    )
     
     # Build a neighbor map: all satellites within 200 km of the target
     target_pos = [target_state.x, target_state.y, target_state.z]
@@ -528,4 +565,5 @@ async def judge_manipulate_satellite(req: JudgeManipulateRequest):
         "cascade_depth": cascade_summary.get("cascade_depth", 0),
         "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
         "agencies_involved": cascade_summary.get("agencies_involved", []),
+        "debris_clouds": debris_clouds,
     }

@@ -1,5 +1,6 @@
 """
 WebSocket connection manager.
+<<<<<<< HEAD
 Handles multi-client connections and 1Hz satellite broadcast.
 
 Enhanced broadcast payload includes covariance_ellipse for satellites
@@ -9,11 +10,20 @@ uncertainty ellipses around threatened satellites.
 
 import asyncio
 import json
+=======
+Handles multi-client connections and periodic satellite broadcast.
+"""
+
+import asyncio
+import os
+>>>>>>> a807e61320556541bc8c65f9ccd38523da4f391c
 import logging
 from fastapi import WebSocket
 from app.core.state_cache import get_latest_snapshot, get_latest_alerts
 
 logger = logging.getLogger(__name__)
+
+BROADCAST_INTERVAL_SECONDS = float(os.getenv("BROADCAST_INTERVAL_SECONDS", "1"))
 
 
 class ConnectionManager:
@@ -76,12 +86,16 @@ async def satellite_broadcast_loop(
     manager: ConnectionManager,
 ):
     """
+<<<<<<< HEAD
     Background task: broadcast the latest cached snapshot at 1Hz.
 
     Enriches the satellite list with covariance_ellipse fields from active
     conjunction alerts. Field is None for non-threatened satellites and
     contains ellipse parameters {a, b, angle, affection_rate, predicted_fragments}
     for satellites in active conjunctions.
+=======
+    Background task: broadcast the latest cached snapshot on a slower cadence.
+>>>>>>> a807e61320556541bc8c65f9ccd38523da4f391c
     """
     while True:
         try:
@@ -121,4 +135,4 @@ async def satellite_broadcast_loop(
         except Exception as e:
             logger.error(f"Broadcast error: {e}")
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(BROADCAST_INTERVAL_SECONDS)

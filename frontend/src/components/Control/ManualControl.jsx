@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import useStore from '../../store/useStore';
+import useTestMode from '../../hooks/useTestMode';
 import PreflightModal from './PreflightModal';
 
-const apiBaseUrl = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const apiBaseUrl = '';
 
 const ManualControl = () => {
   const maneuver = useStore((s) => s.maneuver);
@@ -17,6 +18,11 @@ const ManualControl = () => {
     return s.satellites.find((sat) => sat.norad_id === s.selectedSatelliteId) || null;
   });
   const setSimulationActive = useStore((s) => s.setSimulationActive);
+  const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
+  const setTestActive = useTestMode((s) => s.setTestActive);
+  const setSelectedA = useTestMode((s) => s.setSelectedA);
+  const setSelectedB = useTestMode((s) => s.setSelectedB);
+  
   const [showPreflight, setShowPreflight] = useState(false);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -84,13 +90,22 @@ const ManualControl = () => {
       const resp = await fetch(`${apiBaseUrl}/api/simulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'approaching' }),
+        body: JSON.stringify({ name: 'collision_hotspot' }),
       });
       const data = await resp.json();
       console.log('Scenario loaded:', data);
+      
+      // Auto-target the two dummy satellites that spawn
+      setSelectedSatelliteId(99901); 
+      setTestActive(true);
+      setSelectedA({ name: 'SAT-COLLIDER-A', norad_id: 99901 });
+      setSelectedB({ name: 'SAT-COLLIDER-B', norad_id: 99902 });
+      
+      setResult({ status: 'SUCCESS', message: 'Scenario Triggered!' });
       setSimulationActive(true);
     } catch (e) {
       console.error('Scenario trigger failed:', e);
+      setResult({ status: 'ERROR', error: e.message });
     }
   };
 

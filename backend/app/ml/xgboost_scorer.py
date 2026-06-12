@@ -212,6 +212,50 @@ def train_risk_model(
     return model
 
 
+def train_risk_model_from_samples(
+    features: np.ndarray,
+    targets: np.ndarray,
+    rounds: int = 24,
+    learning_rate: float = 0.18,
+) -> BoostedRiskModel:
+    features = np.asarray(features, dtype=float)
+    targets = np.asarray(targets, dtype=float)
+    if features.ndim != 2 or targets.ndim != 1:
+        raise ValueError("features must be 2D and targets must be 1D")
+
+    base_prob = float(np.clip(targets.mean(), 1e-4, 1.0 - 1e-4))
+    base_logit = float(np.log(base_prob / (1.0 - base_prob)))
+    raw_scores = np.full(features.shape[0], base_logit, dtype=float)
+
+    stumps: list[DecisionStump] = []
+    for _ in range(rounds):
+        probabilities = sigmoid(raw_scores)
+        residual = targets - probabilities
+        stump = _best_stump(features, residual)
+        if stump is None:
+            break
+        stumps.append(stump)
+        raw_scores += learning_rate * stump.predict(features)
+
+    model = BoostedRiskModel(
+        base_logit=base_logit,
+        learning_rate=learning_rate,
+        stumps=stumps,
+        feature_names=[],
+    )
+    save_artifact(
+        RISK_ARTIFACT,
+        {
+            "trained_from": "shadow_mode_finetune",
+            "sample_count": int(features.shape[0]),
+            "rounds": rounds,
+            "model": model.to_dict(),
+        },
+    )
+    logger.info("Shadow-mode risk model fine-tune with %d samples", features.shape[0])
+    return model
+
+
 def load_or_train_risk_model(retrain: bool = False) -> BoostedRiskModel:
     from .artifacts import artifact_path
 

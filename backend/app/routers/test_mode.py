@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
+from types import SimpleNamespace
 from threading import RLock
 from typing import Optional
 
@@ -14,7 +15,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
 from app.core.sgp4_propagator import SGP4Propagator
+from app.core.state_cache import set_latest_alerts
 from app.services.conjunction_solver import parse_eci_state, run_to_tca
+from app.services.debris_model import build_debris_alerts
 
 router = APIRouter(prefix="/api/test")
 
@@ -161,6 +164,99 @@ def _build_satellite(input_data: SatelliteInput, epoch: datetime) -> TestSatelli
     )
 
 
+def _to_test_state(satellite: TestSatellite) -> SimpleNamespace:
+    return SimpleNamespace(
+        error_code=0,
+        norad_id=_normalize_norad_id(satellite.norad_id),
+        name=satellite.name,
+        x=float(satellite.position_eci_km[0]),
+        y=float(satellite.position_eci_km[1]),
+        z=float(satellite.position_eci_km[2]),
+        vx=float(satellite.velocity_eci_kms[0]),
+        vy=float(satellite.velocity_eci_kms[1]),
+        vz=float(satellite.velocity_eci_kms[2]),
+        epoch_utc=satellite.epoch_utc,
+    )
+
+
+def _publish_collision_alerts(sat_a: TestSatellite, sat_b: TestSatellite, result) -> dict:
+    hotspot_position = [
+        (sat_a.position_eci_km[0] + sat_b.position_eci_km[0]) / 2.0,
+        (sat_a.position_eci_km[1] + sat_b.position_eci_km[1]) / 2.0,
+        (sat_a.position_eci_km[2] + sat_b.position_eci_km[2]) / 2.0,
+    ]
+    tca_time = _parse_epoch(result.tca_utc, sat_a.epoch_utc)
+    sat1_id = _normalize_norad_id(sat_a.norad_id)
+    sat2_id = _normalize_norad_id(sat_b.norad_id)
+
+    alerts = [{
+        "sat1": {"id": sat1_id, "name": sat_a.name},
+        "sat2": {"id": sat2_id, "name": sat_b.name},
+        "miss_distance_km": round(float(result.miss_distance_m) / 1000.0, 6),
+        "relative_speed_kmh": round(float(result.relative_velocity_kms) * 3600.0, 3),
+        "p_collision": 1.0,
+        "cpi_score": 10.0,
+        "hotspot_score": 10.0,
+        "severity": "high",
+        "tca_minutes": 0.0,
+        "tca_hours": 0.0,
+        "tca_utc": tca_time.isoformat(),
+        "hotspot_position": {
+            "x": round(float(hotspot_position[0]), 3),
+            "y": round(float(hotspot_position[1]), 3),
+            "z": round(float(hotspot_position[2]), 3),
+        },
+        "zone_radius_km": 100.0,
+    }]
+
+    hotspots = [{
+        "sat1": {"id": sat1_id, "name": sat_a.name},
+        "sat2": {"id": sat2_id, "name": sat_b.name},
+        "miss_distance_km": round(float(result.miss_distance_m) / 1000.0, 6),
+        "relative_velocity_kmh": round(float(result.relative_velocity_kms) * 3600.0, 3),
+        "p_collision": 1.0,
+        "cpi_score": 10.0,
+        "hotspot_score": 10.0,
+        "severity": "high",
+        "tca_minutes": 0.0,
+        "tca_hours": 0.0,
+        "tca_utc": tca_time.isoformat(),
+        "position": {
+            "x": round(float(hotspot_position[0]), 3),
+            "y": round(float(hotspot_position[1]), 3),
+            "z": round(float(hotspot_position[2]), 3),
+        },
+        "zone_radius_km": 100.0,
+    }]
+
+    debris_clouds = build_debris_alerts(
+        hotspots,
+        [_to_test_state(sat_a), _to_test_state(sat_b)],
+        tca_time.isoformat(),
+        alerts=alerts,
+        cpi_threshold=7.0,
+    )
+
+    payload = {
+        "timestamp": tca_time.isoformat(),
+        "alerts": alerts,
+        "count": len(alerts),
+        "hotspots": hotspots,
+        "graph": {"node_count": 2, "edge_count": 1, "influence_radius_km": 200.0},
+        "cascade_plan": [],
+        "cascade_depth": 1,
+        "total_delta_v_ms": 0.0,
+        "agencies_involved": [],
+        "seed_satellites": [sat_a.name, sat_b.name],
+        "cpi_threshold": 7.0,
+        "node_probabilities": {},
+        "debris_clouds": debris_clouds,
+    }
+
+    set_latest_alerts(payload)
+    return payload
+
+
 @router.post("/setup")
 async def setup_test(req: TestSetupRequest):
     epoch = _parse_epoch(req.epoch_utc)
@@ -209,6 +305,27 @@ async def run_to_tca_endpoint(req: RunToTcaRequest):
         use_j2=True,
     )
 
+    alert_payload = {
+        "timestamp": result.tca_utc,
+        "alerts": [],
+        "count": 0,
+        "hotspots": [],
+        "graph": {},
+        "cascade_plan": [],
+        "cascade_depth": 0,
+        "total_delta_v_ms": 0.0,
+        "agencies_involved": [],
+        "seed_satellites": [],
+        "cpi_threshold": 7.0,
+        "node_probabilities": {},
+        "debris_clouds": [],
+    }
+
+    if result.collision_detected or result.miss_distance_m <= 100.0:
+        alert_payload = _publish_collision_alerts(sat_a, sat_b, result)
+    else:
+        set_latest_alerts(alert_payload)
+
     return {
         "tca_utc": result.tca_utc,
         "miss_distance_m": result.miss_distance_m,
@@ -218,6 +335,17 @@ async def run_to_tca_endpoint(req: RunToTcaRequest):
         "collision_detected": result.collision_detected,
         "trajectory_a": result.trajectory_a,
         "trajectory_b": result.trajectory_b,
+        "alerts": alert_payload.get("alerts", []),
+        "hotspots": alert_payload.get("hotspots", []),
+        "cascade_plan": alert_payload.get("cascade_plan", []),
+        "graph": alert_payload.get("graph", {}),
+        "cascade_depth": alert_payload.get("cascade_depth", 0),
+        "total_delta_v_ms": alert_payload.get("total_delta_v_ms", 0.0),
+        "agencies_involved": alert_payload.get("agencies_involved", []),
+        "seed_satellites": alert_payload.get("seed_satellites", []),
+        "cpi_threshold": alert_payload.get("cpi_threshold", 7.0),
+        "node_probabilities": alert_payload.get("node_probabilities", {}),
+        "debris_clouds": alert_payload.get("debris_clouds", []),
     }
 
 

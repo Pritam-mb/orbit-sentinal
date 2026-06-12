@@ -1,0 +1,49 @@
+{
+  "generated_at": "2026-05-08T23:50:14.318172+00:00",
+  "classification_models": [
+    {
+      "name": "Risk Scorer",
+      "type": "classification",
+      "metrics": {
+        "accuracy": 0.9385,
+        "precision": 0.9308,
+        "recall": 0.9137,
+        "f1": 0.9221,
+        "samples": 4096
+      }
+    },
+    {
+      "name": "Graph Cascade",
+      "type": "classification",
+      "metrics": {
+        "accuracy": 0.9876,
+        "precision": 0.9846,
+        "recall": 0.9869,
+        "f1": 0.9857,
+        "samples": 2985
+      }
+    },
+    {
+      "name": "GAT Cascade",
+      "type": "classification",
+      "metrics": {
+        "accuracy": 0.9876,
+        "precision": 0.9846,
+        "recall": 0.9869,
+        "f1": 0.9857,
+        "samples": 2985
+      }
+    }
+  ],
+  "regression_models": [
+    {
+      "name": "Trajectory Predictor",
+      "type": "regression",
+      "metrics": {
+        "mae": 226.9309,
+        "rmse": 281.7355,
+        "samples": 768
+      }
+    }
+  ]
+}

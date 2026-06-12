@@ -12,6 +12,10 @@ const useStore = create((set, get) => ({
   alerts: [],
   cascadePlan: null,
   hotspots: [],
+  debrisClouds: [],
+  modelMetrics: null,
+  simulationDrawerOpen: true,
+  metricsDrawerOpen: true,
 
   // Maneuver controls
   maneuver: { dvx: 0, dvy: 0, dvz: 0 },
@@ -21,6 +25,9 @@ const useStore = create((set, get) => ({
 
   // Simulation
   simulationActive: false,
+
+  // Agency filtering
+  agencyFilter: null,
 
   // Actions
   setSatellites: (sats) => set({ satellites: sats }),
@@ -47,6 +54,14 @@ const useStore = create((set, get) => ({
 
   setHotspots: (hotspots) => set({ hotspots }),
 
+  setDebrisClouds: (debrisClouds) => set({ debrisClouds }),
+
+  setModelMetrics: (modelMetrics) => set({ modelMetrics }),
+
+  setSimulationDrawerOpen: (simulationDrawerOpen) => set({ simulationDrawerOpen }),
+
+  setMetricsDrawerOpen: (metricsDrawerOpen) => set({ metricsDrawerOpen }),
+
   setManeuver: (axis, value) =>
     set((state) => ({
       maneuver: { ...state.maneuver, [axis]: value },
@@ -57,6 +72,8 @@ const useStore = create((set, get) => ({
   setWsConnected: (connected) => set({ wsConnected: connected }),
 
   setSimulationActive: (active) => set({ simulationActive: active }),
+
+  setAgencyFilter: (filter) => set({ agencyFilter: filter }),
 }));
 
 export default useStore;

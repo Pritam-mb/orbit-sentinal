@@ -1,6 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import useStore from '../../store/useStore';
-import { eciToLla } from '../../utils/coords';
+import { eciToLla, generateKeplerianOrbit } from '../../utils/coords';
+
+const apiBaseUrl = '';
+const detailPollMs = 5000;
 
 const computeSpeedKmh = (velocity) => {
   if (!velocity) return null;
@@ -38,18 +41,22 @@ const TelemetryPanel = () => {
   const satellites = useStore((s) => s.satellites);
   const setSelectedOrbit = useStore((s) => s.setSelectedOrbit);
   const [satelliteDetail, setSatelliteDetail] = useState(null);
+  const detailFetchInFlight = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     let detailTimer = null;
     let orbitTimer = null;
 
-    const apiBaseUrl = 'http://127.0.0.1:8000';
-
     const loadSelectedSatellite = async () => {
+      if (cancelled || detailFetchInFlight.current) return;
+
+      detailFetchInFlight.current = true;
+
       if (!selectedSatelliteId) {
         setSatelliteDetail(null);
         setSelectedOrbit([]);
+        detailFetchInFlight.current = false;
         return;
       }
 
@@ -58,6 +65,9 @@ const TelemetryPanel = () => {
         null;
 
       setSatelliteDetail(enrichSatellite(fallbackSatellite));
+      if (fallbackSatellite?.position && fallbackSatellite?.velocity) {
+        setSelectedOrbit(generateKeplerianOrbit(fallbackSatellite, 120, 20));
+      }
 
       try {
         const resp = await fetch(`${apiBaseUrl}/api/satellites/${selectedSatelliteId}`);
@@ -65,34 +75,16 @@ const TelemetryPanel = () => {
 
         const data = await resp.json();
         if (!cancelled) {
-          setSatelliteDetail(enrichSatellite({
-            ...fallbackSatellite,
-            ...data,
-          }));
+          const upToDateSat = enrichSatellite({ ...fallbackSatellite, ...data });
+          setSatelliteDetail(upToDateSat);
+          if (data.position && data.velocity) {
+            setSelectedOrbit(generateKeplerianOrbit(upToDateSat, 120, 20));
+          }
         }
       } catch (error) {
         console.error('Selected satellite detail fetch failed:', error);
-      }
-    };
-
-    const loadOrbit = async () => {
-      if (!selectedSatelliteId) {
-        setSelectedOrbit([]);
-        return;
-      }
-
-      try {
-        const resp = await fetch(
-          `${apiBaseUrl}/api/satellites/${selectedSatelliteId}/orbit?span_minutes=180&step_seconds=10`
-        );
-        if (!resp.ok) return;
-
-        const data = await resp.json();
-        if (!cancelled) {
-          setSelectedOrbit(data.orbit || []);
-        }
-      } catch (error) {
-        console.error('Selected orbit fetch failed:', error);
+      } finally {
+        detailFetchInFlight.current = false;
       }
     };
 
@@ -104,19 +96,12 @@ const TelemetryPanel = () => {
     }
 
     loadSelectedSatellite();
-    loadOrbit();
-
-    detailTimer = setInterval(loadSelectedSatellite, 1000);
-    orbitTimer = setInterval(loadOrbit, 30000);
+    detailTimer = setInterval(loadSelectedSatellite, detailPollMs);
 
     return () => {
       cancelled = true;
-      if (detailTimer) {
-        clearInterval(detailTimer);
-      }
-      if (orbitTimer) {
-        clearInterval(orbitTimer);
-      }
+      detailFetchInFlight.current = false;
+      if (detailTimer) clearInterval(detailTimer);
     };
   }, [selectedSatelliteId, satellites, setSelectedOrbit]);
 

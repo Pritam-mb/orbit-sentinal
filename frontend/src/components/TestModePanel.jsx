@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import useStore from '../store/useStore';
 import useTestMode from '../hooks/useTestMode';
 
-const apiBaseUrl = 'http://127.0.0.1:8000';
+const API_BASE = '';
 
 const Section = ({ title, defaultOpen = true, children }) => {
   const [open, setOpen] = useState(defaultOpen);
@@ -110,6 +110,10 @@ const OverrideForm = ({ label, dataKey, override, setOverrideMode, setOverrideVe
 
 const TestModePanel = () => {
   const satellites = useStore((s) => s.satellites);
+  const setAlerts = useStore((s) => s.setAlerts);
+  const setCascadePlan = useStore((s) => s.setCascadePlan);
+  const setHotspots = useStore((s) => s.setHotspots);
+  const setDebrisClouds = useStore((s) => s.setDebrisClouds);
   const {
     selectedA,
     selectedB,
@@ -193,7 +197,7 @@ const TestModePanel = () => {
       const satelliteB = buildSatellitePayload(selectedB, overrideB);
       const epoch = satelliteA.epoch_utc || satelliteB.epoch_utc || '';
 
-      const resp = await fetch(`${apiBaseUrl}/api/test/setup`, {
+      const resp = await fetch(`${API_BASE}/api/test/setup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -265,7 +269,7 @@ const TestModePanel = () => {
     }
 
     try {
-      const resp = await fetch(`${apiBaseUrl}/api/test/run-to-tca`, {
+      const resp = await fetch(`${API_BASE}/api/test/run-to-tca`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -286,6 +290,28 @@ const TestModePanel = () => {
         relVelocityKms: data.relative_velocity_kms,
         collisionDetected: data.collision_detected,
       });
+      if (Object.prototype.hasOwnProperty.call(data, 'alerts')) {
+        setAlerts(data.alerts || []);
+      }
+      if (Object.prototype.hasOwnProperty.call(data, 'hotspots')) {
+        setHotspots(data.hotspots || []);
+      }
+      if (Object.prototype.hasOwnProperty.call(data, 'cascade_plan')) {
+        setCascadePlan({
+          graph: data.graph || {},
+          alerts: data.alerts || [],
+          cascade_plan: data.cascade_plan || [],
+          total_delta_v_ms: data.total_delta_v_ms || 0,
+          cascade_depth: data.cascade_depth || 0,
+          agencies_involved: data.agencies_involved || [],
+          seed_satellites: data.seed_satellites || [],
+          cpi_threshold: data.cpi_threshold || 7.0,
+          node_probabilities: data.node_probabilities || {},
+        });
+      }
+      if (Object.prototype.hasOwnProperty.call(data, 'debris_clouds')) {
+        setDebrisClouds(data.debris_clouds || []);
+      }
       setSimControl({ currentEpochUtc: data.tca_utc });
       setTestSatellites({
         a: testSatellites.a

@@ -17,10 +17,11 @@ from typing import Any
 
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.optimize import minimize
 
 from app.core.conjunction import classify_severity, find_tca
 from app.core.sgp4_propagator import SatelliteState, rsw_to_eci
-from app.ml.gnn_cascade import CascadeGNN
+from app.ml.gat_cascade import CascadeGAT
 from app.ml.xgboost_scorer import XGBoostScorer
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ class CascadePlanner:
 
     def __init__(self):
         self.risk_model = XGBoostScorer()
-        self.gnn = CascadeGNN()
+        self.gnn = CascadeGAT()
 
     def build_graph(
         self,
@@ -353,6 +354,56 @@ class CascadePlanner:
         else:
             seed_ids = [node.norad_id for node in ranked_nodes[:3]]
 
+        resolved_maneuvers = self._resolve_cascade(
+            seed_ids=seed_ids,
+            nodes=nodes,
+            node_index=node_index,
+            adjacency=adjacency,
+            maneuver_probability=maneuver_probability,
+            gnn_depth=gnn_depth,
+            max_depth=max_depth,
+            max_maneuvers=max_maneuvers,
+            cpi_threshold=cpi_threshold,
+        )
+
+        optimized_maneuvers, optimization_summary = self._optimize_cascade_plan(
+            resolved_maneuvers,
+            cpi_threshold=cpi_threshold,
+        )
+
+        agencies_involved = sorted({maneuver["agency"] for maneuver in optimized_maneuvers})
+        total_delta_v_ms = round(sum(maneuver["maneuver"]["delta_v_ms"] for maneuver in optimized_maneuvers), 3)
+        max_cascade_depth = max([1] + [maneuver["cascade_depth"] for maneuver in optimized_maneuvers])
+
+        return {
+            "graph": graph["summary"],
+            "alerts": self._serialize_alerts(edges),
+            "hotspots": hotspots,
+            "cascade_plan": optimized_maneuvers,
+            "seed_satellites": seed_ids,
+            "total_delta_v_ms": total_delta_v_ms,
+            "cascade_depth": max_cascade_depth,
+            "agencies_involved": agencies_involved,
+            "cpi_threshold": cpi_threshold,
+            "optimization": optimization_summary,
+            "node_probabilities": {
+                str(node.norad_id): round(float(maneuver_probability[node_index[node.norad_id]]), 3)
+                for node in nodes
+            },
+        }
+
+    def _resolve_cascade(
+        self,
+        seed_ids: list[int],
+        nodes: list[CascadeNode],
+        node_index: dict[int, int],
+        adjacency: dict[int, list[dict[str, Any]]],
+        maneuver_probability: np.ndarray,
+        gnn_depth: np.ndarray,
+        max_depth: int,
+        max_maneuvers: int,
+        cpi_threshold: float,
+    ) -> list[dict[str, Any]]:
         queue = deque((sat_id, 1, None, "PRIMARY_CONJUNCTION") for sat_id in seed_ids)
         visited: set[int] = set()
         resolved_maneuvers: list[dict[str, Any]] = []
@@ -427,25 +478,101 @@ class CascadePlanner:
                         )
                     )
 
-        agencies_involved = sorted({maneuver["agency"] for maneuver in resolved_maneuvers})
-        total_delta_v_ms = round(sum(maneuver["maneuver"]["delta_v_ms"] for maneuver in resolved_maneuvers), 3)
-        max_cascade_depth = max([1] + [maneuver["cascade_depth"] for maneuver in resolved_maneuvers])
+        return resolved_maneuvers
 
-        return {
-            "graph": graph["summary"],
-            "alerts": self._serialize_alerts(edges),
-            "hotspots": hotspots,
-            "cascade_plan": resolved_maneuvers,
-            "seed_satellites": seed_ids,
-            "total_delta_v_ms": total_delta_v_ms,
-            "cascade_depth": max_cascade_depth,
-            "agencies_involved": agencies_involved,
-            "cpi_threshold": cpi_threshold,
-            "node_probabilities": {
-                str(node.norad_id): round(float(maneuver_probability[node_index[node.norad_id]]), 3)
-                for node in nodes
-            },
+    def _optimize_cascade_plan(
+        self,
+        maneuvers: list[dict[str, Any]],
+        cpi_threshold: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if not maneuvers:
+            return [], {
+                "status": "empty",
+                "initial_total_delta_v_ms": 0.0,
+                "optimized_total_delta_v_ms": 0.0,
+                "optimization_gain_pct": 0.0,
+                "iterations": 0,
+            }
+
+        base_delta_v = np.array([float(m["maneuver"]["delta_v_ms"]) for m in maneuvers], dtype=float)
+        risk_before = np.array([float(m.get("risk_before", 0.0)) for m in maneuvers], dtype=float)
+        maneuver_prob = np.array([float(m.get("maneuver_probability", 0.0)) for m in maneuvers], dtype=float)
+        node_targets = np.array([max(0.5, min(risk_before[i] * 0.75, cpi_threshold - 0.25)) for i in range(len(maneuvers))], dtype=float)
+
+        x0 = np.ones(len(maneuvers), dtype=float)
+        bounds = [(0.45, 1.9) for _ in maneuvers]
+
+        def adjusted_risk(scale_vector: np.ndarray) -> np.ndarray:
+            total_dv = base_delta_v * scale_vector
+            return np.maximum(0.0, risk_before - (maneuver_prob * 3.0) - (total_dv * 0.6))
+
+        def objective(scale_vector: np.ndarray) -> float:
+            total_dv = float(np.sum(base_delta_v * scale_vector))
+            risk_penalty = float(np.sum(np.square(np.maximum(0.0, adjusted_risk(scale_vector) - node_targets))))
+            smoothness_penalty = float(np.sum(np.square(scale_vector - 1.0)))
+            return total_dv + (1.5 * risk_penalty) + (0.05 * smoothness_penalty)
+
+        constraints = []
+        for idx in range(len(maneuvers)):
+            constraints.append({
+                "type": "ineq",
+                "fun": lambda scale_vector, i=idx: float(node_targets[i] - adjusted_risk(scale_vector)[i]),
+            })
+
+        try:
+            result = minimize(
+                objective,
+                x0,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"maxiter": 200, "ftol": 1e-6},
+            )
+            scales = np.asarray(result.x if result.success and result.x is not None else x0, dtype=float)
+            status = "optimized" if result.success else "fallback"
+            iterations = int(getattr(result, "nit", 0) or 0)
+            objective_value = float(result.fun) if result.success and result.fun is not None else float(objective(scales))
+        except Exception as error:
+            logger.warning("Cascade optimizer failed, using unoptimized maneuvers: %s", error)
+            scales = x0
+            status = "fallback"
+            iterations = 0
+            objective_value = float(objective(scales))
+
+        optimized_maneuvers = []
+        for idx, (maneuver, scale) in enumerate(zip(maneuvers, scales, strict=False)):
+            updated = dict(maneuver)
+            base_vec = np.array([
+                float(maneuver["maneuver"]["dv_r"]),
+                float(maneuver["maneuver"]["dv_s"]),
+                float(maneuver["maneuver"]["dv_w"]),
+            ], dtype=float)
+            optimized_vec = base_vec * float(scale)
+            optimized_delta_v = float(np.linalg.norm(optimized_vec))
+            updated["optimization_scale"] = round(float(scale), 3)
+            updated["maneuver"]["dv_r"] = round(float(optimized_vec[0]), 3)
+            updated["maneuver"]["dv_s"] = round(float(optimized_vec[1]), 3)
+            updated["maneuver"]["dv_w"] = round(float(optimized_vec[2]), 3)
+            updated["maneuver"]["delta_v_ms"] = round(optimized_delta_v, 3)
+            updated["optimization_status"] = status
+            per_scale = np.array([scale if j == idx else 1.0 for j in range(len(maneuvers))], dtype=float)
+            updated["optimized_risk_after"] = round(float(adjusted_risk(per_scale)[idx]), 2)
+            optimized_maneuvers.append(updated)
+
+        initial_total = float(np.sum(base_delta_v))
+        optimized_total = float(np.sum([m["maneuver"]["delta_v_ms"] for m in optimized_maneuvers]))
+        optimization_summary = {
+            "status": status,
+            "iterations": iterations,
+            "initial_total_delta_v_ms": round(initial_total, 3),
+            "optimized_total_delta_v_ms": round(optimized_total, 3),
+            "optimization_gain_pct": round(max(0.0, (1.0 - (optimized_total / max(initial_total, 1e-6))) * 100.0), 2),
+            "objective_value": round(float(objective_value), 4),
+            "maneuver_count": len(maneuvers),
+            "scale_factors": [round(float(scale), 3) for scale in scales],
         }
+
+        return optimized_maneuvers, optimization_summary
 
     def _build_gnn_inputs(
         self,
@@ -549,6 +676,7 @@ class CascadePlanner:
     def _serialize_alerts(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized = []
         for item in sorted(edges, key=lambda edge: edge["cpi_score"], reverse=True):
+            hotspot_position = item.get("hotspot_position") or {"x": 0.0, "y": 0.0, "z": 0.0}
             normalized.append(
                 {
                     "sat1": {"id": item["source_id"], "name": item["source_name"]},
@@ -562,6 +690,9 @@ class CascadePlanner:
                     "p_collision": item["p_collision"],
                     "hotspot_score": item.get("hotspot_score", 0.0),
                     "influence_weight": item["influence_weight"],
+                    "position": hotspot_position,
+                    "zone_radius_km": 100.0,
+                    "tca_hours": round(float(item.get("tca_minutes", 0.0)) / 60.0, 2),
                 }
             )
 
@@ -584,6 +715,10 @@ class CascadePlanner:
                     "severity": item["severity"],
                     "hotspot_score": item.get("hotspot_score", 0.0),
                     "position": hotspot_position,
+                    "affected_satellites": item.get("affected_satellites", []),
+                    "affected_count": item.get("affected_count", 0),
+                    "zone_radius_km": 100.0,
+                    "tca_hours": round(float(item.get("tca_minutes", 0.0)) / 60.0, 2),
                 }
             )
 
