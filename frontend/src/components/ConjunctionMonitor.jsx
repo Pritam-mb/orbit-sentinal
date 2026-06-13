@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import useTestMode from '../hooks/useTestMode';
 
 const formatDuration = (totalSeconds) => {
@@ -12,16 +12,44 @@ const formatDuration = (totalSeconds) => {
 
 const ConjunctionMonitor = () => {
   const {
+    testActive,
     prediction,
     computed,
     thresholds,
     separationKm,
     closingRateKms,
     timeToTcaSeconds,
+    setSeparation,
     setThresholds,
   } = useTestMode();
 
   const [showThresholds, setShowThresholds] = useState(false);
+
+  useEffect(() => {
+    if (!testActive) {
+      setSeparation({ separationKm: null, closingRateKms: null, timeToTcaSeconds: null });
+      return;
+    }
+
+    const fetchSeparation = async () => {
+      try {
+        const res = await fetch('/api/test/separation');
+        if (!res.ok) return;
+        const data = await res.json();
+        setSeparation({
+          separationKm: data.separation_km,
+          closingRateKms: data.closing_rate_kms,
+          timeToTcaSeconds: data.time_to_tca_s,
+        });
+      } catch (e) {
+        console.error('Failed to fetch separation:', e);
+      }
+    };
+
+    fetchSeparation();
+    const timer = setInterval(fetchSeparation, 1000);
+    return () => clearInterval(timer);
+  }, [testActive, setSeparation]);
 
   const formattedTcaSeconds = useMemo(() => timeToTcaSeconds, [timeToTcaSeconds]);
 

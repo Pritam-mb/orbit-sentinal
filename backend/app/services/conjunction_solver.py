@@ -32,6 +32,8 @@ class TcaResult:
     relative_velocity_kms: float
     position_a_eci: list[float]
     position_b_eci: list[float]
+    velocity_a_eci: list[float]
+    velocity_b_eci: list[float]
     collision_detected: bool
     trajectory_a: list[list]
     trajectory_b: list[list]
@@ -157,6 +159,8 @@ def run_to_tca(
         relative_velocity_kms=round(rel_velocity_kms, 5),
         position_a_eci=[float(x) for x in positions_a[min_index]],
         position_b_eci=[float(x) for x in positions_b[min_index]],
+        velocity_a_eci=[float(x) for x in velocities_a[min_index]],
+        velocity_b_eci=[float(x) for x in velocities_b[min_index]],
         collision_detected=collision_detected,
         trajectory_a=trajectory_a,
         trajectory_b=trajectory_b,

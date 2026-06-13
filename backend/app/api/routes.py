@@ -34,7 +34,8 @@ class ManeuverRequest(BaseModel):
 
 
 class ScenarioRequest(BaseModel):
-    name: str
+    name: str | None = None
+    scenario: str | None = None
 
 
 class JudgeManipulateRequest(BaseModel):
@@ -81,18 +82,23 @@ def _build_snapshot(current_propagator, dt: datetime) -> dict:
         for state in active_states
     ]
 
+    from app.core.debris_model import debris_model
+    debris_clouds = debris_model.get_frontend_debris_clouds(active_states)
+
     snapshot = {
         "type": "update",
         "timestamp": dt.isoformat(),
         "satellites": satellites,
         "count": len(states),
         "states": active_states,
+        "debris_clouds": debris_clouds,
     }
     snapshot["payload"] = json.dumps({
         "type": snapshot["type"],
         "timestamp": snapshot["timestamp"],
         "satellites": satellites,
         "count": snapshot["count"],
+        "debris_clouds": debris_clouds,
     }, separators=(",", ":"))
     return snapshot
 
@@ -178,6 +184,8 @@ async def get_satellite_maneuver_history(norad_id: int):
 async def get_alerts():
     """Get current conjunction alerts."""
     alerts_snapshot = get_latest_alerts()
+    snapshot = get_latest_snapshot()
+    debris_clouds = snapshot.get("debris_clouds", [])
     return {
         "alerts": alerts_snapshot.get("alerts", []),
         "count": alerts_snapshot.get("count", 0),
@@ -191,7 +199,7 @@ async def get_alerts():
         "seed_satellites": alerts_snapshot.get("seed_satellites", []),
         "cpi_threshold": alerts_snapshot.get("cpi_threshold", 5.0),
         "node_probabilities": alerts_snapshot.get("node_probabilities", {}),
-        "debris_clouds": alerts_snapshot.get("debris_clouds", []),
+        "debris_clouds": debris_clouds,
     }
 
 
@@ -382,8 +390,20 @@ async def trigger_scenario(req: ScenarioRequest):
     if _sim_engine is None:
         return {"status": "ERROR", "message": "Sim engine not initialized"}
 
+    name = req.name or req.scenario
+    if not name:
+        raise HTTPException(status_code=400, detail="Scenario name is required")
+
+    # Map cascade_demo to the actual collision_hotspot scenario
+    if name == "cascade_demo":
+        name = "collision_hotspot"
+
     try:
-        result = _sim_engine.load_scenario(req.name)
+        result = _sim_engine.load_scenario(name)
+        # Update snapshot immediately so the new satellites show up on the UI
+        if _propagator:
+            snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+            set_latest_snapshot(snapshot)
         return {"status": "LOADED", **result}
     except FileNotFoundError as e:
         return {"status": "ERROR", "message": str(e)}
@@ -395,6 +415,64 @@ async def clear_scenario():
     if _sim_engine:
         _sim_engine.clear_scenario()
     return {"status": "CLEARED"}
+
+
+@router.post("/debris/simulate")
+async def simulate_collision_event():
+    """Trigger a demo collision event."""
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    from app.core.debris_model import debris_model
+    # Simulate a catastrophic collision in LEO
+    pos_a = [6778.0, 0.0, 0.0]
+    vel_a = [0.0, 7.7, 0.0]
+    cloud = debris_model.simulate_collision(
+        collision_point_eci_km=pos_a,
+        collision_velocity_eci_kms=vel_a,
+        mass_p_kg=500.0,
+        mass_q_kg=500.0,
+        rel_vel_kms=10.0,
+        max_fragments_simulated=100,
+        event_id="demo_collision_1"
+    )
+    
+    snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+    set_latest_snapshot(snapshot)
+    
+    return {"status": "SUCCESS", "fragments_generated": len(cloud.fragments)}
+
+
+@router.delete("/debris/active")
+async def clear_debris():
+    """Clear all active debris clouds."""
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    from app.core.debris_model import debris_model
+    debris_model.clear()
+    
+    snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+    set_latest_snapshot(snapshot)
+    
+    return {"status": "CLEARED"}
+
+
+@router.post("/simulation/reset")
+async def reset_simulation():
+    """Reset the simulation and clear debris."""
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    if _sim_engine:
+        _sim_engine.clear_scenario()
+    from app.core.debris_model import debris_model
+    debris_model.clear()
+    
+    snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+    set_latest_snapshot(snapshot)
+    
+    return {"status": "RESET"}
 
 
 @router.get("/scenarios")

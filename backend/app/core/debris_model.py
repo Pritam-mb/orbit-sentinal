@@ -402,6 +402,83 @@ class DebrisModel:
     def list_event_ids(self) -> list[str]:
         return list(self._clouds.keys())
 
+    def clear(self):
+        """Clear all simulated debris clouds."""
+        self._clouds.clear()
+
+    def get_frontend_debris_clouds(self, states: list) -> list[dict]:
+        """Format and return the debris clouds in the format expected by the frontend."""
+        import numpy as np
+        frontend_clouds = []
+        for event_id, cloud in self._clouds.items():
+            # Calculate radius of active fragments from collision point
+            active_frags = [f for f in cloud.fragments if not f.is_decayed]
+            collision_pos = np.array(cloud.collision_point_km)
+            if active_frags:
+                distances = [np.linalg.norm(np.array([f.x, f.y, f.z]) - collision_pos) for f in active_frags]
+                radius_km = max(distances)
+            else:
+                radius_km = 0.0
+
+            # Minimum visible radius so it displays nicely
+            radius_km = max(radius_km, 10.0)
+
+            # Find affected satellites within the radius
+            affected_satellites = []
+            for state in states:
+                # support both objects and dicts
+                if isinstance(state, dict):
+                    err = state.get("error_code", 0)
+                    if err != 0:
+                        continue
+                    x = state.get("x", 0.0)
+                    y = state.get("y", 0.0)
+                    z = state.get("z", 0.0)
+                    norad_id = state.get("norad_id")
+                    name = state.get("name")
+                else:
+                    err = getattr(state, "error_code", 0)
+                    if err != 0:
+                        continue
+                    x = getattr(state, "x", 0.0)
+                    y = getattr(state, "y", 0.0)
+                    z = getattr(state, "z", 0.0)
+                    norad_id = getattr(state, "norad_id", None)
+                    name = getattr(state, "name", None)
+
+                sat_pos = np.array([x, y, z])
+                dist = np.linalg.norm(sat_pos - collision_pos)
+                if dist <= radius_km:
+                    affected_satellites.append({
+                        "norad_id": norad_id,
+                        "name": name,
+                        "cpi_score": 5.0,
+                        "severity": "medium",
+                        "risk_band": "medium",
+                        "recommended_action": "monitor"
+                    })
+
+            frontend_clouds.append({
+                "id": cloud.event_id,
+                "tca_utc": cloud.created_at,
+                "minutes_to_tca": 0.0,
+                "center_eci_km": {
+                    "x": cloud.collision_point_km[0],
+                    "y": cloud.collision_point_km[1],
+                    "z": cloud.collision_point_km[2]
+                },
+                "radius_km_now": round(radius_km, 3),
+                "radius_km_at_tca": round(radius_km, 3),
+                "max_radius_km": 1500.0,
+                "fragment_count": cloud.predicted_count,
+                "affected_satellites": affected_satellites,
+                "affected_count": len(affected_satellites),
+                "affected_high_risk": 0,
+                "radius_timeline": [],
+                "shells": [{"label": "now", "radius_km": round(radius_km, 3)}]
+            })
+        return frontend_clouds
+
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
 debris_model = DebrisModel()

@@ -113,6 +113,7 @@ async def satellite_broadcast_loop(
                         "timestamp": snapshot.get("timestamp"),
                         "satellites": enriched,
                         "count": snapshot.get("count", len(satellites)),
+                        "debris_clouds": snapshot.get("debris_clouds", []),
                     }
                     payload = json.dumps(payload_obj, separators=(",", ":"))
                 else:

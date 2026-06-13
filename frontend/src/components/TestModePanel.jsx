@@ -275,7 +275,7 @@ const TestModePanel = () => {
         body: JSON.stringify({
           target_utc: prediction.tcaUtc,
           step_seconds: sim.stepSeconds,
-          max_steps: 3600,
+          max_steps: 10000,
         }),
       });
 
@@ -289,6 +289,8 @@ const TestModePanel = () => {
         missDistanceM: data.miss_distance_m,
         relVelocityKms: data.relative_velocity_kms,
         collisionDetected: data.collision_detected,
+        trajectoryA: data.trajectory_a,
+        trajectoryB: data.trajectory_b,
       });
       if (Object.prototype.hasOwnProperty.call(data, 'alerts')) {
         setAlerts(data.alerts || []);

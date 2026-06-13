@@ -86,7 +86,17 @@ function App() {
         const data = await res.json();
         if (!cancelled) {
           setAlerts(data.alerts || []);
-          setCascadePlan(data.cascade_plan || null);
+          setCascadePlan({
+            graph: data.graph || {},
+            alerts: data.alerts || [],
+            cascade_plan: data.cascade_plan || [],
+            total_delta_v_ms: data.total_delta_v_ms || 0,
+            cascade_depth: data.cascade_depth || 0,
+            agencies_involved: data.agencies_involved || [],
+            seed_satellites: data.seed_satellites || [],
+            cpi_threshold: data.cpi_threshold || 5.0,
+            node_probabilities: data.node_probabilities || {},
+          });
           setHotspots(data.hotspots || []);
           setDebrisClouds(data.debris_clouds || []);
         }

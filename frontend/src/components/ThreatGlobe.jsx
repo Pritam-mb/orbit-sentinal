@@ -1,7 +1,11 @@
 import React, { useRef, useEffect, useCallback } from 'react';
+import useTestMode from '../hooks/useTestMode';
 
 const TWO_PI = Math.PI * 2;
 const DEG = Math.PI / 180;
+// ... (rest of COAST_LINES definition unchanged)
+// Let's keep from eciToLatLon to ThreatGlobe component
+
 
 // Simplified coastline data as lat/lon polylines (very compressed)
 // Each sub-array is a connected polyline [[lat,lon],...]
@@ -108,6 +112,9 @@ function satColor(cpi) {
 export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatId }) {
   const canvasRef = useRef(null);
   const stateRef = useRef({ viewLon: 80, animId: null, frame: 0 });
+  const testActive = useTestMode((s) => s.testActive);
+  const testSatellites = useTestMode((s) => s.testSatellites);
+  const computed = useTestMode((s) => s.computed);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -154,30 +161,101 @@ export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatI
     // ── Coastlines ───────────────────────────────────────────────────────
     drawCoastlines(ctx, viewLon, cx, cy, R);
 
+    // ── Crossing Trajectories (Orbits) for Test Mode ──────────────────────
+    if (testActive && computed?.trajectoryA && computed?.trajectoryB) {
+      // Draw Trajectory A (Cyan)
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.7)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let penDown = false;
+      for (const pt of computed.trajectoryA) {
+        const ll = eciToLatLon(pt[1], pt[2], pt[3]);
+        if (!ll) continue;
+        const p = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
+        if (!p.visible) {
+          penDown = false;
+          continue;
+        }
+        if (!penDown) {
+          ctx.moveTo(p.sx, p.sy);
+          penDown = true;
+        } else {
+          ctx.lineTo(p.sx, p.sy);
+        }
+      }
+      ctx.stroke();
+
+      // Draw Trajectory B (Magenta)
+      ctx.strokeStyle = 'rgba(236, 72, 153, 0.7)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      penDown = false;
+      for (const pt of computed.trajectoryB) {
+        const ll = eciToLatLon(pt[1], pt[2], pt[3]);
+        if (!ll) continue;
+        const p = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
+        if (!p.visible) {
+          penDown = false;
+          continue;
+        }
+        if (!penDown) {
+          ctx.moveTo(p.sx, p.sy);
+          penDown = true;
+        } else {
+          ctx.lineTo(p.sx, p.sy);
+        }
+      }
+      ctx.stroke();
+    }
+
     // ── Build alert-satellite lookup ──────────────────────────────────────
     const alertSatIds = new Set();
     const satCpiMap = new Map(); // satId → max cpi
     for (const a of alerts) {
       const cpi = Number(a.cpi_score ?? 0);
       if (a.sat1?.id != null) {
-        alertSatIds.add(a.sat1.id);
-        satCpiMap.set(a.sat1.id, Math.max(satCpiMap.get(a.sat1.id) ?? 0, cpi));
+        alertSatIds.add(Number(a.sat1.id));
+        satCpiMap.set(Number(a.sat1.id), Math.max(satCpiMap.get(Number(a.sat1.id)) ?? 0, cpi));
       }
       if (a.sat2?.id != null) {
-        alertSatIds.add(a.sat2.id);
-        satCpiMap.set(a.sat2.id, Math.max(satCpiMap.get(a.sat2.id) ?? 0, cpi));
+        alertSatIds.add(Number(a.sat2.id));
+        satCpiMap.set(Number(a.sat2.id), Math.max(satCpiMap.get(Number(a.sat2.id)) ?? 0, cpi));
       }
     }
 
     // ── Conjunction lines ─────────────────────────────────────────────────
     const satPosMap = new Map(); // satId → {lat,lon,sx,sy,visible}
-    const alertSatObjs = satellites.filter((s) => alertSatIds.has(s.norad_id));
+    let alertSatObjs = satellites.filter((s) => alertSatIds.has(Number(s.norad_id)));
+
+    if (testActive && testSatellites.a && testSatellites.b) {
+      const satAId = Number(testSatellites.a.norad_id);
+      const satBId = Number(testSatellites.b.norad_id);
+      
+      const testSatA = {
+        norad_id: satAId,
+        name: testSatellites.a.name,
+        position: testSatellites.a.position,
+      };
+      const testSatB = {
+        norad_id: satBId,
+        name: testSatellites.b.name,
+        position: testSatellites.b.position,
+      };
+      
+      alertSatObjs = [testSatA, testSatB, ...alertSatObjs];
+      
+      alertSatIds.add(satAId);
+      alertSatIds.add(satBId);
+      if (!satCpiMap.has(satAId)) satCpiMap.set(satAId, 10.0);
+      if (!satCpiMap.has(satBId)) satCpiMap.set(satBId, 10.0);
+    }
+
     for (const sat of alertSatObjs) {
       const pos = sat.position ?? {};
       const ll = eciToLatLon(pos.x ?? 0, pos.y ?? 0, pos.z ?? 0);
       if (!ll) continue;
       const proj = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
-      satPosMap.set(sat.norad_id, { ...proj, ll });
+      satPosMap.set(Number(sat.norad_id), { ...proj, ll });
     }
 
     for (const alert of alerts) {

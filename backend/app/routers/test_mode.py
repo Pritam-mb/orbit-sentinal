@@ -14,10 +14,14 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from app.core.sgp4_propagator import SGP4Propagator
+from app.core.sgp4_propagator import SGP4Propagator, SatelliteState
 from app.core.state_cache import set_latest_alerts
 from app.services.conjunction_solver import parse_eci_state, run_to_tca
 from app.services.debris_model import build_debris_alerts
+from app.services.cascade_planner import CascadePlanner
+from app.core.analytics import compute_collision_probability
+
+_cascade_planner = CascadePlanner()
 
 router = APIRouter(prefix="/api/test")
 
@@ -180,81 +184,200 @@ def _to_test_state(satellite: TestSatellite) -> SimpleNamespace:
 
 
 def _publish_collision_alerts(sat_a: TestSatellite, sat_b: TestSatellite, result) -> dict:
-    hotspot_position = [
-        (sat_a.position_eci_km[0] + sat_b.position_eci_km[0]) / 2.0,
-        (sat_a.position_eci_km[1] + sat_b.position_eci_km[1]) / 2.0,
-        (sat_a.position_eci_km[2] + sat_b.position_eci_km[2]) / 2.0,
-    ]
     tca_time = _parse_epoch(result.tca_utc, sat_a.epoch_utc)
     sat1_id = _normalize_norad_id(sat_a.norad_id)
     sat2_id = _normalize_norad_id(sat_b.norad_id)
 
-    alerts = [{
+    # Propagate a sampled set of constellation satellites to the TCA epoch to avoid blocking the event loop
+    active_states = []
+    if _propagator is not None:
+        ids = _propagator.norad_ids
+        if len(ids) > 250:
+            step = max(1, len(ids) // 250)
+            sampled_ids = ids[::step][:250]
+        else:
+            sampled_ids = ids
+
+        for norad_id in sampled_ids:
+            state = _propagator.propagate_one(norad_id, tca_time)
+            if state is not None and state.error_code == 0:
+                active_states.append(state)
+
+    # Build the SatelliteState containers for manual test satellites at TCA
+    state_a_tca = SatelliteState(norad_id=sat1_id, name=sat_a.name)
+    state_a_tca.x = result.position_a_eci[0]
+    state_a_tca.y = result.position_a_eci[1]
+    state_a_tca.z = result.position_a_eci[2]
+    state_a_tca.vx = result.velocity_a_eci[0]
+    state_a_tca.vy = result.velocity_a_eci[1]
+    state_a_tca.vz = result.velocity_a_eci[2]
+    state_a_tca.epoch_utc = result.tca_utc
+    state_a_tca.error_code = 0
+
+    state_b_tca = SatelliteState(norad_id=sat2_id, name=sat_b.name)
+    state_b_tca.x = result.position_b_eci[0]
+    state_b_tca.y = result.position_b_eci[1]
+    state_b_tca.z = result.position_b_eci[2]
+    state_b_tca.vx = result.velocity_b_eci[0]
+    state_b_tca.vy = result.velocity_b_eci[1]
+    state_b_tca.vz = result.velocity_b_eci[2]
+    state_b_tca.epoch_utc = result.tca_utc
+    state_b_tca.error_code = 0
+
+    # Combine all states (constellation + manual test satellites)
+    all_states = active_states + [state_a_tca, state_b_tca]
+
+    # Dynamically compute collision probability and B-plane parameters using foster_integrate
+    state_a_dict = {
+        "x": state_a_tca.x, "y": state_a_tca.y, "z": state_a_tca.z,
+        "vx": state_a_tca.vx, "vy": state_a_tca.vy, "vz": state_a_tca.vz
+    }
+    state_b_dict = {
+        "x": state_b_tca.x, "y": state_b_tca.y, "z": state_b_tca.z,
+        "vx": state_b_tca.vx, "vy": state_b_tca.vy, "vz": state_b_tca.vz
+    }
+
+    try:
+        prob_res = compute_collision_probability(state_a_dict, state_b_dict)
+        p_col = prob_res.get("p_collision", 0.0)
+        bt_km = prob_res.get("b_t_km", 0.0)
+        bn_km = prob_res.get("b_n_km", 0.0)
+        covariance_ellipse = prob_res.get("covariance_ellipse") or {}
+    except Exception as exc:
+        logger.warning("compute_collision_probability failed for test satellites: %s", exc)
+        miss_km = result.miss_distance_m / 1000.0
+        p_col = math.exp(-0.5 * (miss_km / 0.5)**2)
+        bt_km = 0.0
+        bn_km = 0.0
+        covariance_ellipse = {
+            "a": 3000.0,
+            "b": 1000.0,
+            "angle": 0.5,
+            "affection_rate": p_col * 100.0,
+            "predicted_fragments": 150
+        }
+
+    miss_km = result.miss_distance_m / 1000.0
+    cpi = max(1.0, min(10.0, 10.0 - 1.8 * miss_km))  # scales down to 1.0 at 5km
+    severity = "critical" if cpi >= 8.0 else "warning" if cpi >= 5.0 else "watch"
+
+    primary_alert = {
         "sat1": {"id": sat1_id, "name": sat_a.name},
         "sat2": {"id": sat2_id, "name": sat_b.name},
-        "miss_distance_km": round(float(result.miss_distance_m) / 1000.0, 6),
+        "miss_distance_km": round(miss_km, 6),
         "relative_speed_kmh": round(float(result.relative_velocity_kms) * 3600.0, 3),
-        "p_collision": 1.0,
-        "cpi_score": 10.0,
-        "hotspot_score": 10.0,
-        "severity": "high",
+        "p_collision": p_col,
+        "cpi_score": cpi,
+        "hotspot_score": cpi,
+        "severity": severity,
         "tca_minutes": 0.0,
         "tca_hours": 0.0,
-        "tca_utc": tca_time.isoformat(),
+        "tca_utc": result.tca_utc,
+        "bt_km": bt_km,
+        "bn_km": bn_km,
+        "b_plane_bt_km": bt_km,
+        "b_plane_bn_km": bn_km,
         "hotspot_position": {
-            "x": round(float(hotspot_position[0]), 3),
-            "y": round(float(hotspot_position[1]), 3),
-            "z": round(float(hotspot_position[2]), 3),
+            "x": round(float(state_a_tca.x + state_b_tca.x) / 2.0, 3),
+            "y": round(float(state_a_tca.y + state_b_tca.y) / 2.0, 3),
+            "z": round(float(state_a_tca.z + state_b_tca.z) / 2.0, 3),
         },
         "zone_radius_km": 100.0,
-    }]
+        "covariance_ellipse": covariance_ellipse
+    }
 
-    hotspots = [{
+    # Run the CascadePlanner to score risks, predict GNN probabilities, and construct the cascade plan
+    cascade_summary = _cascade_planner.analyze_snapshot(
+        states=all_states,
+        alerts=[primary_alert],
+        propagator=_propagator,
+        reference_time=tca_time,
+        cpi_threshold=5.0
+    )
+
+    planner_alerts = cascade_summary.get("alerts", [])
+    has_primary = any(
+        (a["sat1"]["id"] == sat1_id and a["sat2"]["id"] == sat2_id) or
+        (a["sat1"]["id"] == sat2_id and a["sat2"]["id"] == sat1_id)
+        for a in planner_alerts
+    )
+    if not has_primary:
+        planner_alerts.insert(0, primary_alert)
+    else:
+        for a in planner_alerts:
+            if (a["sat1"]["id"] == sat1_id and a["sat2"]["id"] == sat2_id) or (a["sat1"]["id"] == sat2_id and a["sat2"]["id"] == sat1_id):
+                if "covariance_ellipse" not in a or not a["covariance_ellipse"]:
+                    a["covariance_ellipse"] = primary_alert["covariance_ellipse"]
+                a["bt_km"] = bt_km
+                a["bn_km"] = bn_km
+                a["b_plane_bt_km"] = bt_km
+                a["b_plane_bn_km"] = bn_km
+
+    # Inject default covariance ellipse fields for other alerts if they are missing
+    for a in planner_alerts:
+        if "covariance_ellipse" not in a or not a["covariance_ellipse"]:
+            a_miss_km = a.get("miss_distance_km", 1.0)
+            a_p_col = a.get("p_collision", 0.01)
+            a["covariance_ellipse"] = {
+                "a": max(100.0, a_miss_km * 400.0),
+                "b": max(50.0, a_miss_km * 150.0),
+                "angle": 0.5,
+                "affection_rate": round(a_p_col * 100.0, 2),
+                "predicted_fragments": 150
+            }
+
+    hotspots = cascade_summary.get("hotspots", [])
+    primary_hotspot = {
         "sat1": {"id": sat1_id, "name": sat_a.name},
         "sat2": {"id": sat2_id, "name": sat_b.name},
-        "miss_distance_km": round(float(result.miss_distance_m) / 1000.0, 6),
+        "miss_distance_km": round(miss_km, 6),
         "relative_velocity_kmh": round(float(result.relative_velocity_kms) * 3600.0, 3),
-        "p_collision": 1.0,
-        "cpi_score": 10.0,
-        "hotspot_score": 10.0,
-        "severity": "high",
+        "p_collision": p_col,
+        "cpi_score": cpi,
+        "hotspot_score": cpi,
+        "severity": severity,
         "tca_minutes": 0.0,
         "tca_hours": 0.0,
-        "tca_utc": tca_time.isoformat(),
-        "position": {
-            "x": round(float(hotspot_position[0]), 3),
-            "y": round(float(hotspot_position[1]), 3),
-            "z": round(float(hotspot_position[2]), 3),
-        },
+        "tca_utc": result.tca_utc,
+        "position": primary_alert["hotspot_position"],
         "zone_radius_km": 100.0,
-    }]
+    }
+    has_primary_hotspot = any(
+        (h["sat1"]["id"] == sat1_id and h["sat2"]["id"] == sat2_id) or
+        (h["sat1"]["id"] == sat2_id and h["sat2"]["id"] == sat1_id)
+        for h in hotspots
+    )
+    if not has_primary_hotspot:
+        hotspots.insert(0, primary_hotspot)
 
+    # Build debris alerts dynamically with all states
     debris_clouds = build_debris_alerts(
         hotspots,
-        [_to_test_state(sat_a), _to_test_state(sat_b)],
+        all_states,
         tca_time.isoformat(),
-        alerts=alerts,
-        cpi_threshold=7.0,
+        alerts=planner_alerts,
+        cpi_threshold=5.0
     )
 
     payload = {
         "timestamp": tca_time.isoformat(),
-        "alerts": alerts,
-        "count": len(alerts),
+        "alerts": planner_alerts,
+        "count": len(planner_alerts),
         "hotspots": hotspots,
-        "graph": {"node_count": 2, "edge_count": 1, "influence_radius_km": 200.0},
-        "cascade_plan": [],
-        "cascade_depth": 1,
-        "total_delta_v_ms": 0.0,
-        "agencies_involved": [],
-        "seed_satellites": [sat_a.name, sat_b.name],
-        "cpi_threshold": 7.0,
-        "node_probabilities": {},
+        "graph": cascade_summary.get("graph", {}),
+        "cascade_plan": cascade_summary.get("cascade_plan", []),
+        "cascade_depth": cascade_summary.get("cascade_depth", 1),
+        "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
+        "agencies_involved": cascade_summary.get("agencies_involved", []),
+        "seed_satellites": cascade_summary.get("seed_satellites", [sat_a.name, sat_b.name]),
+        "cpi_threshold": 5.0,
+        "node_probabilities": cascade_summary.get("node_probabilities", {}),
         "debris_clouds": debris_clouds,
     }
 
     set_latest_alerts(payload)
     return payload
+
 
 
 @router.post("/setup")
@@ -321,7 +444,7 @@ async def run_to_tca_endpoint(req: RunToTcaRequest):
         "debris_clouds": [],
     }
 
-    if result.collision_detected or result.miss_distance_m <= 100.0:
+    if result.collision_detected or result.miss_distance_m <= 5000.0:
         alert_payload = _publish_collision_alerts(sat_a, sat_b, result)
     else:
         set_latest_alerts(alert_payload)

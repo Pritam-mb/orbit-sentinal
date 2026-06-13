@@ -88,6 +88,9 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
             covariances[state.norad_id] = kal_dict.get("covariance_6x6")
             set_kalman_state(state.norad_id, kal_dict)
 
+    from app.core.debris_model import debris_model
+    debris_clouds = debris_model.get_frontend_debris_clouds(active_states)
+
     snapshot = {
         "type": "update",
         "timestamp": dt.isoformat(),
@@ -95,12 +98,14 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
         "count": len(states),
         "states": active_states,
         "covariances": covariances,
+        "debris_clouds": debris_clouds,
     }
     snapshot["payload"] = json.dumps({
         "type": snapshot["type"],
         "timestamp": snapshot["timestamp"],
         "satellites": satellites,
         "count": snapshot["count"],
+        "debris_clouds": debris_clouds,
     }, separators=(",", ":"))
     return snapshot
 
@@ -108,6 +113,12 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
 async def refresh_snapshot_once():
     try:
         now = datetime.now(timezone.utc)
+
+        # Propagate debris fragments in the core model
+        from app.core.debris_model import debris_model
+        for event_id in debris_model.list_event_ids():
+            await asyncio.to_thread(debris_model.propagate_fragments, event_id, dt_seconds=1.0)
+
         snapshot = await asyncio.to_thread(build_snapshot, propagator, now)
         set_latest_snapshot(snapshot)
         if ENABLE_EXTENDED_PIPELINE and ml_runtime is not None and snapshot.get("states"):
@@ -261,7 +272,8 @@ async def lifespan(app: FastAPI):
     print("=== Model initialization complete ===")
 
     # Load live TLEs when Space-Track credentials are configured, otherwise fall back.
-    tles = await fetch_tles(max_sats=0)
+    max_sats = int(os.getenv("MAX_SATS", "500"))
+    tles = await fetch_tles(max_sats=max_sats)
     propagator.load_tles(tles)
     logger.info(f"Tracking {propagator.satellite_count} satellites from current TLE source")
 
