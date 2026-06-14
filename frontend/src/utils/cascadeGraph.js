@@ -50,12 +50,19 @@ export function buildCascadeGraph(alerts) {
     if (bId != null) ensureNode(bId, bName, alert.sat2?.agency, cpi, severity);
 
     if (aId != null && bId != null) {
+      const tcaHours = alert.tca_hours != null
+        ? Number(alert.tca_hours)
+        : alert.tca_minutes != null
+          ? Number(alert.tca_minutes) / 60
+          : null;
       edges.push({
         id: alert.id ?? `${aId}-${bId}`,
         source: aId,
         target: bId,
         p_collision: Number(alert.p_collision ?? alert.probability ?? 0),
         miss_distance: Number(alert.miss_distance_km ?? 0),
+        tca_hours: tcaHours,
+        tca_utc: alert.tca_utc ?? null,
         severity,
         status: 'active',
       });

@@ -126,11 +126,30 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
       </div>
 
       {/* TCA countdown */}
-      <div className="threat-tca-countdown">
-        <span className="tca-label">TCA</span>
-        <span className={`tca-time ${critical ? 'critical' : urgent ? 'urgent' : ''}`}>
-          {formatted}
-        </span>
+      <div className="threat-tca-countdown" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <span className="tca-label">TCA</span>
+          <span className={`tca-time ${critical ? 'critical' : urgent ? 'urgent' : ''}`}>
+            {formatted}
+          </span>
+        </div>
+        {alert.tca_utc && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '4px',
+            background: critical ? 'rgba(239,68,68,0.1)' : urgent ? 'rgba(234,179,8,0.1)' : 'rgba(74,144,217,0.1)',
+            borderRadius: 4, padding: '2px 6px',
+            border: `1px solid ${critical ? 'rgba(239,68,68,0.3)' : urgent ? 'rgba(234,179,8,0.3)' : 'rgba(74,144,217,0.3)'}`,
+          }}>
+            <span style={{ fontSize: '9px', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>⏱ COLLISION:</span>
+            <span style={{
+              fontSize: '9px', fontFamily: 'var(--mono)', fontWeight: 700,
+              color: critical ? 'var(--alert-red)' : urgent ? 'var(--alert-yellow)' : '#4a90d9',
+              letterSpacing: '0.5px',
+            }}>
+              {alert.tca_utc.replace('T', ' ').substring(0, 19)} UTC
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Expanded section */}

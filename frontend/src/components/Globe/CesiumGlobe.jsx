@@ -694,6 +694,7 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], showDebris = false, debrisFra
 
       const debrisColor = Cesium.Color.fromCssColorString('#a855f7');
 
+      // Outer translucent envelope sphere
       const envelope = viewer.entities.add({
         position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
         name: `${cloud.id}-envelope`,
@@ -703,25 +704,54 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], showDebris = false, debrisFra
             debrisRadiusKm * 1000.0,
             debrisRadiusKm * 1000.0,
           ),
-          material: debrisColor.withAlpha(0.58),
+          material: debrisColor.withAlpha(0.22),
           outline: true,
-          outlineColor: debrisColor.withAlpha(0.95),
+          outlineColor: debrisColor.withAlpha(0.9),
+          outlineWidth: 2,
         },
       });
       nextEntities.push(envelope);
 
+      // Bright inner hazard core point
       const debrisCore = viewer.entities.add({
         position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
         name: `${cloud.id}-core`,
         point: {
-          pixelSize: 10,
-          color: Cesium.Color.fromCssColorString('#a855f7').withAlpha(0.98),
-          outlineColor: Cesium.Color.WHITE.withAlpha(0.85),
-          outlineWidth: 1,
+          pixelSize: 14,
+          color: Cesium.Color.fromCssColorString('#f0abfc').withAlpha(0.98),
+          outlineColor: Cesium.Color.fromCssColorString('#a855f7').withAlpha(0.9),
+          outlineWidth: 2,
           disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          scaleByDistance: new Cesium.NearFarScalar(1e5, 2.0, 3e7, 0.6),
         },
       });
       nextEntities.push(debrisCore);
+
+      // Floating label — always visible
+      const fragCount = cloud.fragment_count ?? 0;
+      const labelText = `⚠ DEBRIS FIELD\n${fragCount} FRAGMENTS · r=${debrisRadiusKm.toFixed(0)}km`;
+      const debrisLabel = viewer.entities.add({
+        position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
+        name: `${cloud.id}-label`,
+        label: {
+          text: labelText,
+          font: 'bold 11px JetBrains Mono, monospace',
+          fillColor: Cesium.Color.fromCssColorString('#e879f9'),
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 3,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          pixelOffset: new Cesium.Cartesian2(0, -(debrisRadiusKm > 500 ? 60 : 40)),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          scaleByDistance: new Cesium.NearFarScalar(1e5, 1.4, 3e7, 0.5),
+          translucencyByDistance: new Cesium.NearFarScalar(1e6, 1.0, 3e7, 0.7),
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          showBackground: true,
+          backgroundColor: Cesium.Color.fromCssColorString('#1a0030').withAlpha(0.82),
+          backgroundPadding: new Cesium.Cartesian2(8, 5),
+        },
+      });
+      nextEntities.push(debrisLabel);
     }
 
     primitivesRef.current.debrisEntities = nextEntities;

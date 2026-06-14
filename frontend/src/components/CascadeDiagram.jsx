@@ -144,6 +144,70 @@ export default function CascadeDiagram({ graph = { nodes: [], edges: [] }, alert
         }
 
         ctx.stroke();
+
+        // Draw distance + TCA labels on the edge midpoint
+        const midX = (src.x + tgt.x) / 2;
+        const midY = (src.y + tgt.y) / 2;
+
+        // Distance label
+        if (e.miss_distance > 0) {
+          const distStr = e.miss_distance < 1.0
+            ? `${(e.miss_distance * 1000).toFixed(0)}m`
+            : `${e.miss_distance.toFixed(1)}km`;
+
+          ctx.save();
+          ctx.font = 'bold 8px JetBrains Mono, monospace';
+          const textWidth = ctx.measureText(distStr).width;
+          // pill background
+          const ph = 12, pr = 3;
+          ctx.fillStyle = 'rgba(6, 13, 20, 0.92)';
+          ctx.beginPath();
+          ctx.roundRect
+            ? ctx.roundRect(midX - textWidth / 2 - pr, midY - ph / 2, textWidth + pr * 2, ph, pr)
+            : ctx.fillRect(midX - textWidth / 2 - pr, midY - ph / 2, textWidth + pr * 2, ph);
+          ctx.fill();
+          ctx.strokeStyle = EDGE_COLORS[e.status] ?? '#ef4444';
+          ctx.lineWidth = 0.5;
+          ctx.stroke();
+
+          ctx.fillStyle = e.status === 'active' ? '#fca5a5'
+            : e.status === 'cascade' ? '#fdba74'
+            : '#86efac';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(distStr, midX, midY);
+          ctx.restore();
+        }
+
+        // TCA label (above distance)
+        if (e.tca_hours != null && e.tca_hours > 0) {
+          const tcaStr = e.tca_hours < 1
+            ? `${(e.tca_hours * 60).toFixed(0)}min`
+            : `${e.tca_hours.toFixed(1)}h`;
+          ctx.save();
+          ctx.font = '7px JetBrains Mono, monospace';
+          const tw2 = ctx.measureText(tcaStr).width;
+          ctx.fillStyle = 'rgba(6,13,20,0.85)';
+          ctx.fillRect(midX - tw2 / 2 - 2, midY - 22, tw2 + 4, 10);
+          ctx.fillStyle = 'rgba(251, 191, 36, 0.9)';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(`⏱ ${tcaStr}`, midX, midY - 17);
+          ctx.restore();
+        } else if (e.tca_utc) {
+          const tcaStr = `${e.tca_utc.slice(11, 16)} UTC`;
+          ctx.save();
+          ctx.font = '7px JetBrains Mono, monospace';
+          const tw2 = ctx.measureText(tcaStr).width;
+          ctx.fillStyle = 'rgba(6,13,20,0.85)';
+          ctx.fillRect(midX - tw2 / 2 - 2, midY - 22, tw2 + 4, 10);
+          ctx.fillStyle = 'rgba(251, 191, 36, 0.9)';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(`⏱ ${tcaStr}`, midX, midY - 17);
+          ctx.restore();
+        }
+
         ctx.globalAlpha = 1;
       }
 

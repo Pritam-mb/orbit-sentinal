@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import useTestMode from '../hooks/useTestMode';
+import useStore from '../store/useStore';
 
 const TWO_PI = Math.PI * 2;
 const DEG = Math.PI / 180;
@@ -115,6 +116,9 @@ export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatI
   const testActive = useTestMode((s) => s.testActive);
   const testSatellites = useTestMode((s) => s.testSatellites);
   const computed = useTestMode((s) => s.computed);
+  const debrisClouds = useStore((s) => s.debrisClouds);
+  // Track satellite index order so labels alternate left/right
+  const satIndexRef = useRef(new Map());
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -160,6 +164,75 @@ export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatI
 
     // ── Coastlines ───────────────────────────────────────────────────────
     drawCoastlines(ctx, viewLon, cx, cy, R);
+
+    // ── Debris Clouds ─────────────────────────────────────────────────────
+    if (debrisClouds && debrisClouds.length > 0) {
+      for (const cloud of debrisClouds) {
+        const center = cloud.center_eci_km;
+        if (!center) continue;
+        const ll = eciToLatLon(center.x, center.y, center.z);
+        if (!ll) continue;
+        const p = orthoProject(ll.lat, ll.lon, viewLon, cx, cy, R);
+        if (!p.visible) continue;
+
+        const radiusPx = Math.max(14, (cloud.radius_km_now || 100) * (R / 6371.0));
+        const pulse = 0.5 + 0.5 * Math.sin(frame * 0.07);
+        
+        ctx.save();
+        // Pulsing outer glow
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, radiusPx + 6 + pulse * 4, 0, TWO_PI);
+        ctx.fillStyle = `rgba(168, 85, 247, ${0.08 * pulse})`;
+        ctx.fill();
+
+        // Translucent purple fill
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, radiusPx, 0, TWO_PI);
+        ctx.fillStyle = 'rgba(168, 85, 247, 0.18)';
+        ctx.fill();
+
+        // Dashed purple outline (animated)
+        ctx.strokeStyle = `rgba(168, 85, 247, ${0.6 + 0.3 * pulse})`;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 3]);
+        ctx.lineDashOffset = -frame * 0.3;
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Inner hazard ring
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, Math.max(4, radiusPx * 0.35), 0, TWO_PI);
+        ctx.strokeStyle = 'rgba(251, 113, 133, 0.85)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Center X marker
+        const xs = 3;
+        ctx.strokeStyle = 'rgba(251, 113, 133, 0.9)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(p.sx - xs, p.sy - xs); ctx.lineTo(p.sx + xs, p.sy + xs); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(p.sx + xs, p.sy - xs); ctx.lineTo(p.sx - xs, p.sy + xs); ctx.stroke();
+
+        // Label — title
+        ctx.font = 'bold 9px JetBrains Mono, monospace';
+        ctx.fillStyle = 'rgba(216, 180, 254, 1)';
+        ctx.textAlign = 'center';
+        ctx.fillText('⚠ DEBRIS FIELD', p.sx, p.sy - radiusPx - 14);
+
+        // Fragment count
+        ctx.font = '8px JetBrains Mono, monospace';
+        ctx.fillStyle = 'rgba(168, 85, 247, 0.95)';
+        ctx.fillText(`${cloud.fragment_count || 0} FRAGMENTS`, p.sx, p.sy - radiusPx - 4);
+
+        // Radius
+        const radStr = cloud.radius_km_now ? `r=${cloud.radius_km_now.toFixed(0)}km` : '';
+        if (radStr) {
+          ctx.fillStyle = 'rgba(168, 85, 247, 0.7)';
+          ctx.fillText(radStr, p.sx, p.sy + radiusPx + 10);
+        }
+        ctx.restore();
+      }
+    }
 
     // ── Crossing Trajectories (Orbits) for Test Mode ──────────────────────
     if (testActive && computed?.trajectoryA && computed?.trajectoryB) {
@@ -250,6 +323,16 @@ export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatI
       if (!satCpiMap.has(satBId)) satCpiMap.set(satBId, 10.0);
     }
 
+    // Build a stable index order for label offset alternation
+    let satIdx = 0;
+    satIndexRef.current = new Map();
+    for (const sat of alertSatObjs) {
+      const id = Number(sat.norad_id);
+      if (!satIndexRef.current.has(id)) {
+        satIndexRef.current.set(id, satIdx++);
+      }
+    }
+
     for (const sat of alertSatObjs) {
       const pos = sat.position ?? {};
       const ll = eciToLatLon(pos.x ?? 0, pos.y ?? 0, pos.z ?? 0);
@@ -277,6 +360,51 @@ export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatI
       ctx.lineTo(pB.sx, pB.sy);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // Distance label on midpoint
+      const missKm = Number(alert.miss_distance_km ?? 0);
+      if (missKm > 0 && pA.visible && pB.visible) {
+        const midX = (pA.sx + pB.sx) / 2;
+        const midY = (pA.sy + pB.sy) / 2;
+        const distStr = missKm < 1 ? `${(missKm * 1000).toFixed(0)}m` : `${missKm.toFixed(1)}km`;
+        ctx.save();
+        ctx.font = '7px JetBrains Mono, monospace';
+        const tw = ctx.measureText(distStr).width;
+        ctx.fillStyle = 'rgba(6,13,20,0.88)';
+        ctx.fillRect(midX - tw / 2 - 3, midY - 6, tw + 6, 12);
+        ctx.fillStyle = cpi >= 8 ? '#ef4444' : cpi >= 5 ? '#eab308' : '#4a90d9';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(distStr, midX, midY);
+        ctx.restore();
+      }
+
+      // TCA time label
+      const tcaHours = Number(alert.tca_hours ?? 0);
+      const tcaUtc = alert.tca_utc;
+      if ((tcaHours > 0 || tcaUtc) && pA.visible && pB.visible) {
+        const midX = (pA.sx + pB.sx) / 2;
+        const midY = (pA.sy + pB.sy) / 2 - 14;
+        let tcaStr = '';
+        if (tcaUtc) {
+          // Show time portion only: HH:MM UTC
+          tcaStr = `TCA ${tcaUtc.slice(11, 16)} UTC`;
+        } else if (tcaHours > 0) {
+          tcaStr = `TCA ${tcaHours.toFixed(1)}h`;
+        }
+        if (tcaStr) {
+          ctx.save();
+          ctx.font = '7px JetBrains Mono, monospace';
+          const tw2 = ctx.measureText(tcaStr).width;
+          ctx.fillStyle = 'rgba(6,13,20,0.85)';
+          ctx.fillRect(midX - tw2 / 2 - 3, midY - 6, tw2 + 6, 11);
+          ctx.fillStyle = 'rgba(251, 191, 36, 0.95)';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(tcaStr, midX, midY);
+          ctx.restore();
+        }
+      }
     }
 
     // ── Satellites ────────────────────────────────────────────────────────
@@ -317,13 +445,23 @@ export default function ThreatGlobe({ alerts = [], satellites = [], selectedSatI
         ctx.stroke();
       }
 
-      // Label
-      const sat = alertSatObjs.find((s) => s.norad_id === satId);
+      // Label — alternate left/right based on stable insertion order
+      const sat = alertSatObjs.find((s) => Number(s.norad_id) === satId);
       if (sat) {
         const label = sat.name?.slice(0, 14) ?? `#${satId}`;
         ctx.font = '8px JetBrains Mono, monospace';
         ctx.fillStyle = fill;
-        ctx.fillText(label, proj.sx + r + 3, proj.sy + 3);
+
+        // Even-indexed satellites label right, odd label left
+        const idxOrder = satIndexRef.current.get(satId) ?? 0;
+        if (idxOrder % 2 === 1) {
+          ctx.save();
+          ctx.textAlign = 'right';
+          ctx.fillText(label, proj.sx - r - 3, proj.sy + 3);
+          ctx.restore();
+        } else {
+          ctx.fillText(label, proj.sx + r + 3, proj.sy + 3);
+        }
       }
     }
 
