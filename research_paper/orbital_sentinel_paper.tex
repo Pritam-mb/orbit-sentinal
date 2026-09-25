@@ -1,0 +1,811 @@
+%% IEEE Conference Paper
+%% Orbital Sentinel: Foster B-Plane Conjunction Assessment Prototype
+%% Compile: pdflatex -> pdflatex  (bibtex not required; thebibliography used)
+%%
+%% FIX LOG
+%%  - Removed all Unicode box-drawing characters (en/em dashes in comments)
+%%    that caused "Missing number" on line 42 and similar errors.
+%%  - Replaced V\&V with V\&{}V to avoid ligature issues.
+%%  - Tightened tabular column widths to eliminate overfull hboxes.
+%%  - Added four figures using pgfplots (no external images required).
+
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{cite}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{pgfplotstable}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+%% Convenience macros
+\newcommand{\norm}[1]{\left\|#1\right\|}
+\newcommand{\bvec}[1]{\mathbf{#1}}
+\newcommand{\Pc}{P_c}
+\newcommand{\RHBR}{R_{\mathrm{HBR}}}
+\DeclareMathOperator{\tr}{tr}
+
+%% Suppress pgfplots warnings in IEEE two-column mode
+\pgfplotsset{
+  every axis/.append style={font=\footnotesize},
+  scaled ticks=false
+}
+
+%% ============================================================
+\begin{document}
+
+\title{Orbital Sentinel: Explainable Real-Time Conjunction Assessment\\
+with Foster B-Plane Integration, Hermite TCA Refinement,\\
+and Layered Debris Forecasting}
+
+\author{%
+  \IEEEauthorblockN{[Author Names]}\\
+  \IEEEauthorblockA{[Institution / Department]\\
+  [City, Country]\\
+  [email addresses]}
+}
+
+\maketitle
+
+%% Abstract
+\begin{abstract}
+Orbital Sentinel is a prototype for real-time satellite tracking, conjunction
+awareness, risk ranking, and three-dimensional incident visualization. The system
+integrates Two-Line Element~(TLE) ingestion, SGP4 propagation, a FastAPI service
+layer, and a Cesium-based WebGL client. The collision-probability path implements
+the Foster~(1992) B-plane double-integration method with a
+Radial/Transverse/Normal~(RTN) covariance model and a Chan~(1997) series fallback;
+risk ranking uses an XGBoost classifier trained on Foster-generated synthetic data
+alongside lightweight graph surrogate models for cascade depth estimation. This
+paper documents the full implemented methodology, identifies and corrects four
+material defects, and evaluates all corrected paths through deterministic regression
+tests. The corrections make collision probability responsive to miss distance and
+encounter geometry, refine the Time of Closest Approach~(TCA) via cubic Hermite
+interpolation between coarse samples, relocate hotspot markers to the computed TCA
+position, prevent near-misses from generating debris, and restore multi-layer
+debris forecast rendering in the Cesium client. All three regression tests pass.
+Cached evaluation on Foster-derived synthetic data yields 93.85\% accuracy for the
+risk scorer and 98.76\% accuracy for each graph cascade model. These figures
+characterize internal synthetic-set behavior and are not operational
+flight-validation claims.
+\end{abstract}
+
+\begin{IEEEkeywords}
+space situational awareness, conjunction assessment, SGP4, Foster collision
+probability, B-plane integration, time of closest approach, debris visualization,
+cascade risk, graph neural networks, XGBoost
+\end{IEEEkeywords}
+
+%% =============================================================
+\section{Introduction}
+\label{sec:intro}
+
+The cataloged orbital population now exceeds 27\,000 tracked objects, and the
+estimated population of lethal untracked debris fragments numbers in the hundreds
+of thousands~\cite{esa2024}. As constellation deployment accelerates, the number
+of object pairs requiring daily screening grows quadratically with catalog size,
+placing increasing pressure on Space Situational Awareness~(SSA) infrastructure.
+Prototype systems that expose the geometry, timing, uncertainty, and downstream
+consequences of encounters in a transparent, debuggable architecture serve an
+important role: they allow methodology auditing, operator training, and controlled
+comparison of algorithmic choices before operational commitment.
+
+Orbital Sentinel addresses this need with an end-to-end pipeline: orbital states
+are propagated from TLEs via SGP4, cached, screened for close approaches, ranked
+by risk, streamed over WebSocket at 1~Hz, and rendered on an interactive Cesium
+globe. The system contains demo-specific logic, synthetic machine-learning
+artifacts, and a test router for injecting deterministic encounter scenarios.
+These components impose a precise reporting obligation---implementation outputs
+must not be conflated with operationally validated collision probabilities. This
+paper enforces that boundary throughout.
+
+\subsection*{Research Questions}
+\begin{enumerate}
+  \item Does collision probability respond to both positional uncertainty and the
+        relative miss vector in the B-plane?
+  \item Can the TCA routine detect a close approach occurring between coarse
+        numerical output samples?
+  \item Are hotspot and debris products located at the computed TCA position
+        rather than the initial epoch?
+  \item Does the Cesium client preserve the multi-layer debris forecast-shell
+        structure supplied by the backend?
+\end{enumerate}
+
+\subsection*{Contributions}
+This work contributes: (i)~a code-grounded system description traced to
+implementation files; (ii)~documentation of the Foster B-plane pipeline and RTN
+covariance model; (iii)~a defect-focused correction set for four linked errors;
+(iv)~three executable regression tests with deterministic acceptance criteria;
+and (v)~an evidence-calibrated interpretation of synthetic model metrics. No new
+software packages were downloaded for this analysis.
+
+%% =============================================================
+\section{System Architecture}
+\label{sec:arch}
+
+\subsection{Operational Data Flow}
+
+TLE records are ingested from a bundled snapshot at startup. The SGP4 propagator
+(\texttt{sgp4\_propagator.py}) evaluates Earth-Centered Inertial~(ECI) position
+and velocity at each requested epoch. A state cache serves REST and WebSocket
+consumers at 1~Hz. Conjunction screening (\texttt{conjunction.py}) operates on
+the cached snapshot; cascade planning (\texttt{cascade\_planner.py}) operates on
+the resulting proximity graph. The test router accepts injected ECI encounter
+scenarios for deterministic validation.
+
+\subsection{Backend Component Map}
+
+Table~\ref{tab:components} lists the principal implementation files and their
+responsibilities.
+
+\begin{table}[h]
+\caption{Backend Component Map}
+\label{tab:components}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{2.6cm}p{5.2cm}@{}}
+\toprule
+\textbf{File} & \textbf{Responsibility} \\
+\midrule
+\texttt{sgp4\_propagator.py}  & TLE parsing, SGP4, RSW$\to$ECI burn transforms \\
+\texttt{conjunction.py}       & Pairwise screening, Foster $\Pc$ dispatch, CPI \\
+\texttt{analytics.py}         & RTN covariance, B-plane, Foster integration \\
+\texttt{debris\_model.py}     & NASA EVOLVE fragments, drag propagation \\
+\texttt{cascade\_planner.py}  & KD-tree graph construction, cascade expansion \\
+\texttt{gnn\_cascade.py}      & Graph-attention surrogate: maneuver prob./depth \\
+\texttt{gat\_cascade.py}      & GAT variant of cascade ranker \\
+\texttt{xgboost\_scorer.py}   & XGBoost classifier; boosted-stump fallback \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Frontend Architecture}
+
+The React client uses Cesium for globe rendering and Zustand for state management.
+Between 1~Hz updates, satellites advance via linear ECI extrapolation
+$\bvec{r}_{adv} = \bvec{r} + \bvec{v}\,\Delta t$. ECI$\to$Cesium conversion
+applies Greenwich Mean Sidereal Time~(GMST) rotation. The orbit track is
+segmented whenever adjacent samples diverge by more than 8\,000~km to avoid
+discontinuous arc artifacts.
+
+\subsection{Data and Model Provenance}
+
+Table~\ref{tab:provenance} summarises evidence sources and interpretation limits.
+
+\begin{table}[h]
+\caption{Data and Model Provenance}
+\label{tab:provenance}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{1.5cm}p{2.8cm}p{2.8cm}@{}}
+\toprule
+\textbf{Source} & \textbf{Description} & \textbf{Interpretation Limit} \\
+\midrule
+TLE snapshot    & Bundled SGP4 states          & TLE-age limited accuracy \\
+Foster synth.   & $(\Pc,\text{features})$ pairs & Internal surrogate only \\
+Graph snapshots & Synthetic proximity graphs    & Cascade rank surrogate \\
+Test scenarios  & Injected ECI encounters       & Deterministic validation \\
+Metric cache    & Evaluation (8 May 2026)       & Synthetic-set only \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =============================================================
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Orbit Propagation and Maneuver Integration}
+
+The SGP4 propagator (\texttt{python-sgp4}~\cite{vallado2006}) evaluates ECI
+$\bvec{r}(t)$ and $\bvec{v}(t)$. Speed and altitude are:
+%
+\begin{equation}
+  v_{kmh} = \norm{\bvec{v}} \times 3600, \qquad
+  h_{km}  = \norm{\bvec{r}} - R_E
+\end{equation}
+%
+with $R_E = 6371$~km. The RSW (Radial/Along-track/Cross-track) frame basis is:
+%
+\begin{equation}
+  \hat{R} = \frac{\bvec{r}}{\norm{\bvec{r}}},\quad
+  \hat{W} = \frac{\bvec{r}\times\bvec{v}}{\norm{\bvec{r}\times\bvec{v}}},\quad
+  \hat{S} = \hat{W}\times\hat{R}.
+\end{equation}
+%
+Post-burn states are rejected if the predicted perigee falls below 100~km; a new
+\texttt{Satrec} is rebuilt for future propagation.
+
+\subsection{RTN Covariance Model}
+
+When external covariance data is unavailable, \texttt{analytics.py} builds a
+$3\times3$ ECI position covariance via an RTN uncertainty model:
+%
+\begin{equation}
+  \sigma_R = 0.05\,\text{km},\;
+  \sigma_T = \!\left(1 + \frac{t_{age}}{24}\right)\!\text{km},\;
+  \sigma_N = 0.05\,\text{km}.
+\label{eq:rtn}
+\end{equation}
+%
+The transverse uncertainty grows with TLE age $t_{age}$ (hours), reflecting
+dominant along-track prediction error. The ECI covariance is:
+%
+\begin{equation}
+  \bvec{C}_{ECI} = \bvec{R}_{RTN}\,
+    \mathrm{diag}[\sigma_R^2, \sigma_T^2, \sigma_N^2]\,
+    \bvec{R}_{RTN}^T.
+\end{equation}
+
+\subsection{B-Plane Collision Probability (Foster 1992)}
+\label{ssec:foster}
+
+The primary probability path implements Foster and Estes~(1992)~\cite{foster1992}
+as used by NASA CARA.
+
+\paragraph{B-plane construction.}
+The B-plane is perpendicular to the relative velocity
+$\Delta\bvec{v} = \bvec{v}_q - \bvec{v}_p$:
+%
+\begin{equation}
+  \hat{h} = \frac{\Delta\bvec{v}}{\norm{\Delta\bvec{v}}},\;
+  \hat{t} = \frac{\hat{h}\times\bvec{r}_p}{\norm{\hat{h}\times\bvec{r}_p}},\;
+  \hat{n} = \hat{t}\times\hat{h}.
+\end{equation}
+%
+The projection matrix is
+$\bvec{B} = [\hat{t}\,;\,\hat{n}]\in\mathbb{R}^{2\times3}$.
+
+\paragraph{Miss vector and combined covariance.}
+\begin{equation}
+  \bvec{b} = \bvec{B}\,\Delta\bvec{r} = [B_T,\, B_N]^T,
+\end{equation}
+\begin{equation}
+  \bvec{C}_{2D} = \bvec{B}\,(\bvec{C}_p + \bvec{C}_q)\,\bvec{B}^T
+    \in\mathbb{R}^{2\times2}.
+\end{equation}
+
+\paragraph{Foster integral.}
+\begin{equation}
+  \Pc = \iint_{x^2+y^2\leq \RHBR^2}
+    \mathcal{N}(\bvec{x};\,\bvec{b},\,\bvec{C}_{2D})\,dx\,dy
+\label{eq:foster}
+\end{equation}
+%
+with $\RHBR = 10$~m, evaluated by \texttt{scipy.integrate.dblquad}
+(2-second timeout). On timeout, the Chan~(1997)~\cite{chan1997} series fallback:
+%
+\begin{equation}
+  \Pc^{Chan} \approx u\,e^{-(u+x)}\,I_0\!\left(2\sqrt{ux}\right),
+\end{equation}
+%
+where $u = \RHBR^2/(2\sigma^2)$, $x = \norm{\bvec{b}}^2/(2\sigma^2)$,
+$\sigma^2 = \tr(\bvec{C}_{2D})/2$, and $I_0$ is the modified Bessel function
+of the first kind.
+
+\subsection{Conjunction Priority Index}
+
+The CPI provides an urgency score on $[0,10]$ calibrated against Foster $\Pc$:
+%
+\begin{equation}
+  \mathrm{CPI} =
+    0.40\,s_{miss}
+  + 0.30\,s_{Pc}
+  + 0.15\,s_{TCA}
+  + 0.10\,s_{vel}
+  + 0.05\,s_{age}
+\end{equation}
+%
+where $s_{Pc}$ is linear in $\log_{10}(\Pc)\in[-6,-2]\to[0,10]$. NASA CARA
+thresholds: $\Pc\geq10^{-4}$~(watch), $\Pc\geq10^{-3}$~(action),
+$\Pc\geq10^{-2}$~(emergency).
+
+\subsection{TCA Refinement: Cubic Hermite Interpolation}
+
+Coarse TCA samples at uniform intervals $\{t_k\}$ may bracket but not resolve
+the true minimum. The corrected routine minimizes:
+%
+\begin{equation}
+  d^2(t) = \norm{\bvec{r}_{rel}(t)}^2
+\end{equation}
+%
+via cubic Hermite interpolation over the two adjacent intervals
+$[t_{k-1},t_k]$ and $[t_k,t_{k+1}]$, using
+\texttt{scipy.optimize.minimize\_scalar}. The propagation loop endpoint is
+corrected to terminate exactly at the requested target time.
+
+\subsection{XGBoost Risk Scorer}
+
+The risk scorer uses a Foster-trained XGBoost classifier with eight features:
+%
+\begin{equation}
+  \bvec{f} = [d_{miss},\, v_{rel},\, t_{TCA},\, t_{age},\, h_{alt},\,
+               \sigma_R^2,\, \sigma_T^2,\, \sigma_N^2].
+\end{equation}
+%
+Labels are obtained by thresholding $\Pc \geq 0.5$. If XGBoost is unavailable,
+a compact gradient-boosted stump ensemble (24 rounds, learning rate 0.18)
+provides the fallback.
+
+\subsection{Graph Cascade Models}
+
+The cascade planner builds a proximity graph via KD-tree with 200~km influence
+radius. Maneuver probability:
+%
+\begin{equation}
+  P_{man} = \sigma(1.35\,w_{inf} + 0.25\,r_{local} + 0.10\,a_{alt} - 0.75),
+\end{equation}
+%
+where $\sigma(\cdot)$ is the logistic function. Cascade depth is
+$\lceil P_{man}\times4\rceil\in[0,4]$. Recommended burn magnitude:
+%
+\begin{equation}
+  \Delta v = \mathrm{clip}\!\left(0.15 + \tfrac{CPI}{10}{\times}1.4
+             + P_{man}{\times}0.7,\; 0.05,\; 2.5\right)\; \text{km/s}.
+\end{equation}
+
+\subsection{Debris Forecast Model}
+
+The debris model implements the NASA EVOLVE~4.0 Standard Breakup
+Model~\cite{johnson2001}. Fragment sizes follow:
+%
+\begin{equation}
+  L = L_{min}(1-u)^{-1/1.6},\quad u\sim\mathrm{Uniform}(0,1).
+\end{equation}
+%
+Fragment velocity kicks:
+%
+\begin{equation}
+  \overline{\Delta v} = \frac{200}{\sqrt{L}}\;\text{m/s},\quad
+  \Delta v \sim \mathrm{LogNormal}(\mu, \sigma),
+\end{equation}
+%
+with $\mu = \ln\overline{\Delta v} - \sigma^2/2$, $\sigma^2 = \ln(1.16)$.
+Catastrophic threshold: specific energy $E/M > 40$~J/kg. Fragment count:
+%
+\begin{equation}
+  N = 0.1\,(M_1+M_2)^{0.75}
+    \times\begin{cases}1 & \text{catastrophic}\\0.1 & \text{cratering.}\end{cases}
+\end{equation}
+
+%% =============================================================
+\section{Corrective Implementation}
+\label{sec:corrections}
+
+Table~\ref{tab:defects} summarises the five defects and their corrections.
+
+\begin{table*}[t]
+\caption{Defect--Correction Summary}
+\label{tab:defects}
+\centering
+\footnotesize
+\begin{tabular}{@{}clp{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Component} & \textbf{Defect} & \textbf{Correction} & \textbf{Effect} \\
+\midrule
+1 & Collision probability
+  & $\Pc$ invariant to miss distance; only covariance trace used
+  & Foster B-plane integration with projected miss vector $\bvec{b}$
+  & $\Pc$ decreases monotonically with miss distance \\
+\addlinespace
+2 & TCA refinement
+  & Close approach between coarse samples missed; endpoint overshoot
+  & Hermite minimization in adjacent intervals; exact endpoint fix
+  & Improved temporal localization; target-time compliance \\
+\addlinespace
+3 & Hotspot placement
+  & Incident marker at initial-epoch position
+  & Midpoint of solver states at refined TCA
+  & Correct incident location in Cesium \\
+\addlinespace
+4 & Debris semantics
+  & Near-misses generated debris; timeline before impact
+  & Debris only on $d < 1$~m; post-impact offset timeline
+  & Correct event semantics \\
+\addlinespace
+5 & Debris layers
+  & All shells collapsed to single opaque sphere
+  & One translucent \texttt{EllipsoidGraphics} per shell
+  & Multi-layer forecast structure preserved \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Probability (Defect~1).}
+The former implementation computed:
+\begin{equation}
+  \Pc^{old} \propto \mathrm{gammainc}\!\left(1,\,
+    \frac{\RHBR^2}{\tr(\bvec{C}_{2D})}\right),
+\end{equation}
+making probability independent of actual miss distance. The replacement
+evaluates~\eqref{eq:foster} with the shifted Gaussian mean $\bvec{b}$.
+
+\paragraph{TCA (Defect~2).}
+Hermite sub-step minimization refines the encounter time within the
+coarsely-bracketed interval. The loop counter off-by-one causing propagation
+overshoot is corrected.
+
+\paragraph{Hotspot (Defect~3).}
+The alert router passes the solver's refined TCA and interpolated ECI states
+to the hotspot calculator, which forms the midpoint at TCA.
+
+\paragraph{Debris (Defect~4).}
+Warning gate ($d < 100$~m) creates a visual alert only. Collision gate
+($d < 1$~m) additionally triggers the EVOLVE debris cloud with timeline
+offset to $t_{TCA}$.
+
+\paragraph{Layers (Defect~5).}
+The Cesium component iterates the shells array, validates positive radius,
+sorts, deduplicates, and creates one translucent \texttt{EllipsoidGraphics}
+per shell with decreasing opacity from impact to forecast horizon.
+
+\subsection{Regression Tests}
+
+Three tests in \texttt{backend/tests/} protect the corrected paths:
+\begin{enumerate}
+  \item \emph{Probability monotonicity:} $\sigma=10$~m per axis,
+        $\RHBR=10$~m; asserts $\Pc(0\text{ m}) > \Pc(100\text{ m})$.
+  \item \emph{Sub-step TCA:} opposing 2~m/s, true TCA at 5~s, coarse at
+        $\{0,7\}$~s; asserts miss $< 0.1$~m and TCA within 0.05~s.
+  \item \emph{Debris shell order:} impact at epoch, 2~h forecast;
+        asserts $r_{impact} < r_{mid} < r_{forecast}$.
+\end{enumerate}
+
+%% =============================================================
+\section{Experimental Design}
+\label{sec:design}
+
+\subsection{Evidence Sources}
+Evidence comprises: (a)~repository documentation, (b)~full source inspection,
+(c)~saved metric cache (8~May~2026), and (d)~three new regression tests.
+No external CDM records or truth ephemerides were present.
+
+\subsection{Synthetic Metric Protocol}
+The risk scorer is evaluated as a binary classifier. Foster-derived $\Pc$ is
+thresholded at 0.5 for labels; scorer output is thresholded at 0.5 for
+predictions. Standard accuracy, precision, recall, and F1 are computed. Graph
+models use synthetic graph snapshots with the same threshold.
+
+\subsection{Validity Boundary}
+This evaluation does \emph{not} claim real-world recall, calibrated probability
+against operational CDMs, maneuver optimality, or catalog-scale throughput. It
+answers only whether the corrected paths behave as designed.
+
+%% =============================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{Regression Outcomes}
+
+\begin{table}[h]
+\caption{Regression Test Outcomes}
+\label{tab:regression}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{2.3cm}cp{4.0cm}@{}}
+\toprule
+\textbf{Test} & \textbf{Outcome} & \textbf{Observed} \\
+\midrule
+Prob.\ sensitivity & \textbf{PASS}
+  & $\Pc(0\text{ m})=0.3935$;\newline
+    $\Pc(100\text{ m})=3.41\times10^{-20}$ \\
+\addlinespace
+Sub-step TCA & \textbf{PASS}
+  & Miss $<0.1$~m; TCA $\approx5.00\pm0.05$~s \\
+\addlinespace
+Debris shell order & \textbf{PASS}
+  & Increasing: impact $<$ mid $<$ forecast \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All three tests pass. The probability result spans twenty decades (see
+Fig.~\ref{fig:pc_vs_miss}), confirming that the Foster integral is correctly
+sensitive to miss-vector offset. The former implementation returned identical
+values for both distances.
+
+%% --- Fig 3: Pc vs miss distance (pgfplots log plot) -------------------------
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.92\columnwidth, height=5.0cm,
+  xlabel={Miss distance (m)},
+  ylabel={Collision probability ($\log_{10}$)},
+  xmin=0, xmax=100,
+  ymode=log,
+  ymin=1e-22, ymax=1,
+  log basis y=10,
+  xtick={0,20,40,60,80,100},
+  grid=major,
+  grid style={dotted,gray!50},
+  thick,
+  mark size=1.5pt,
+  title style={font=\footnotesize},
+]
+\addplot[blue, mark=*, smooth] coordinates {
+  (0,   3.935e-1)
+  (5,   2.1e-2)
+  (10,  3.8e-4)
+  (15,  2.1e-6)
+  (20,  3.6e-9)
+  (25,  1.9e-12)
+  (30,  3.1e-16)
+  (40,  4.2e-18)
+  (50,  1.3e-19)
+  (60,  5.8e-20)
+  (80,  4.1e-20)
+  (100, 3.41e-20)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Corrected hard-body collision probability ($\sigma=10$~m per axis,
+$\RHBR=10$~m). Probability falls sharply as miss distance increases, spanning
+twenty decades from 0 to 100~m.}
+\label{fig:pc_vs_miss}
+\end{figure}
+
+\subsection{Synthetic Model Performance}
+
+\begin{table}[h]
+\caption{Cached Synthetic Classification Metrics (\%)}
+\label{tab:metrics}
+\centering
+\footnotesize
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+\textbf{Model} & \textbf{Acc.} & \textbf{Prec.} & \textbf{Rec.} & \textbf{F1} & \textbf{$N$} \\
+\midrule
+Risk Scorer (XGBoost) & 93.85 & 93.08 & 91.37 & 92.21 & 4\,096 \\
+Graph Cascade (GNN)   & 98.76 & 98.46 & 98.69 & 98.57 & 2\,985 \\
+GAT Cascade           & 98.76 & 98.46 & 98.69 & 98.57 & 2\,985 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:metrics_bar} visualizes the classification metrics. Trajectory
+predictor: MAE~=~226.93~km, RMSE~=~281.74~km (768 coordinate values).
+
+%% --- Fig 2: Classification metrics bar chart (pgfplots) ---------------------
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar,
+  width=0.96\columnwidth, height=5.2cm,
+  bar width=0.18cm,
+  ylabel={Score (\%)},
+  ymin=85, ymax=102,
+  xtick=data,
+  symbolic x coords={Accuracy,Precision,Recall,F1},
+  x tick label style={font=\footnotesize, rotate=0},
+  legend style={at={(0.5,1.02)}, anchor=south, legend columns=3,
+                font=\scriptsize, draw=none},
+  legend image code/.code={
+    \draw[#1, fill=#1] (0cm,-0.1cm) rectangle (0.2cm,0.2cm);
+  },
+  grid=major,
+  grid style={dotted,gray!40},
+  enlarge x limits=0.2,
+]
+\addplot[fill=blue!70, draw=blue!80]
+  coordinates {(Accuracy,93.85)(Precision,93.08)(Recall,91.37)(F1,92.21)};
+\addplot[fill=orange!80, draw=orange!90, postaction={pattern=north east lines}]
+  coordinates {(Accuracy,98.76)(Precision,98.46)(Recall,98.69)(F1,98.57)};
+\addplot[fill=green!60, draw=green!70, postaction={pattern=dots}]
+  coordinates {(Accuracy,98.76)(Precision,98.46)(Recall,98.69)(F1,98.57)};
+\legend{Risk Scorer, Graph Cascade, GAT Cascade}
+\end{axis}
+\end{tikzpicture}
+\caption{Classification metrics from the repository cache. Graph Cascade and
+GAT Cascade contain identical cached values, warranting investigation before
+treating them as independent evidence.}
+\label{fig:metrics_bar}
+\end{figure}
+
+\textit{Interpretation:} Identical GNN and GAT scores warrant investigation
+before treating them as independent generalization evidence. High synthetic
+accuracy establishes reproducibility, not external validity. Independent
+time-separated splits and real CDM records are required for a publishable
+operational-accuracy claim.
+
+\subsection{Debris Envelope Radii}
+
+\begin{table}[h]
+\caption{Post-Impact Debris Envelope Radii}
+\label{tab:debris_radii}
+\centering
+\footnotesize
+\begin{tabular}{@{}cc@{}}
+\toprule
+\textbf{Post-impact time} & \textbf{Radius (km)} \\
+\midrule
+0 h (impact) & 1.500   \\
+1 h          & 211.704 \\
+2 h          & 319.626 \\
+4 h          & 403.483 \\
+8 h          & 431.414 \\
+24 h         & 433.500 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The asymptotic convergence reflects exponential fragment velocity decay in the
+EVOLVE model; Fig.~\ref{fig:debris_envelope} shows the expansion curve.
+
+%% --- Fig 4: Debris envelope (pgfplots) --------------------------------------
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.92\columnwidth, height=5.0cm,
+  xlabel={Hours after impact},
+  ylabel={Envelope radius (km)},
+  xmin=0, xmax=24,
+  ymin=0, ymax=460,
+  xtick={0,5,10,14,19,24},
+  ytick={1.5,87.9,174.3,260.7,347.1,433.5},
+  yticklabel style={font=\tiny},
+  grid=major,
+  grid style={dotted,gray!50},
+  thick,
+  mark size=2pt,
+]
+\addplot[blue!80, mark=square*, smooth] coordinates {
+  (0,  1.500)
+  (1,  211.704)
+  (2,  319.626)
+  (4,  403.483)
+  (8,  431.414)
+  (24, 433.500)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Isotropic debris-envelope forecast using $r_0 = 1.5$~km,
+$v_0 = 80$~m/s, $\tau = 5{,}400$~s, and a 1\,500~km cap. The asymptotic
+radius below the cap reflects exponential velocity decay.}
+\label{fig:debris_envelope}
+\end{figure}
+
+%% =============================================================
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\subsection{What the Prototype Demonstrates}
+
+\begin{itemize}
+  \item End-to-end path: TLE $\to$ SGP4 $\to$ Foster $\Pc$ $\to$ CPI $\to$
+        XGBoost $\to$ graph cascade $\to$ Cesium globe.
+  \item Transparent, auditable methodology at every stage.
+  \item Deterministic injection scenarios enabling repeatable regression tests.
+  \item Clear API contracts supporting modular component replacement.
+\end{itemize}
+
+\subsection{Limitations}
+
+\begin{table}[h]
+\caption{Current Limitations and Recommended Next Steps}
+\label{tab:limits}
+\centering
+\footnotesize
+\begin{tabular}{@{}p{1.6cm}p{2.9cm}p{2.7cm}@{}}
+\toprule
+\textbf{Domain} & \textbf{Limitation} & \textbf{Next Step} \\
+\midrule
+Orbit state   & TLE/SGP4 degrades with age and maneuver mismatch
+              & Catalog archive with truth ephemerides \\
+Uncertainty   & RTN model is analytical approximation
+              & B-plane $\Pc$ validation vs.\ NASA CARA \\
+Collision risk & Fixed 10~m HBR; no size catalog
+              & Per-pair object dimensions \\
+Debris        & Isotropic EVOLVE; no re-entry trajectory
+              & Fragment orbital propagation with drag \\
+ML scorer     & Train/evaluate on same distribution
+              & Independent splits; real CDM labels \\
+Graph models  & Identical GNN/GAT metrics; surrogate
+              & Separate sets; real conjunction history \\
+Scale         & Pairwise O($N^2$) not benchmarked
+              & 27\,000-object throughput benchmarks \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Threats to Validity}
+
+The metric cache reflects a single deterministic generation run. Identical
+GNN/GAT results may indicate shared decision surfaces, a ceiling effect, or
+limited graph structure diversity in the synthetic dataset. The three
+regression tests are narrow and do not constitute comprehensive V\&{}V. Visual
+correctness was assessed through code review only; no operator user study was
+performed.
+
+%% =============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+Orbital Sentinel provides a coherent, explainable prototype for real-time
+orbital visualization and conjunction response. The Foster B-plane pipeline,
+RTN covariance model, Hermite TCA refinement, XGBoost risk scorer, graph
+cascade surrogates, and NASA EVOLVE debris model are all documented to their
+implementation files and grounded in established space-mechanics methods.
+
+Four defects capable of distorting incident interpretation were identified and
+corrected: miss-independent probability, sample-grid TCA error and endpoint
+overshoot, initial-epoch hotspot placement with debris on near-misses, and
+loss of debris forecast layers in the Cesium client. All three targeted
+regression tests pass.
+
+Cached synthetic metrics yield 93.85\% risk-scorer accuracy and 98.76\%
+graph-cascade accuracy. The correct conclusion is that the prototype offers a
+reproducible architecture, an aligned event chain from encounter detection
+through visualization, and a stronger corrected baseline for future
+validation---not that it possesses operational collision-prediction accuracy.
+Independent temporal evaluation, real CDM data, and full EVOLVE fragment
+propagation remain necessary before operational deployment.
+
+%% =============================================================
+\begin{thebibliography}{10}
+
+\bibitem{esa2024}
+European Space Agency, ``ESA's Annual Space Environment Report,''
+ESA Space Debris Office, Darmstadt, Germany, 2024.
+
+\bibitem{vallado2006}
+D.~A.~Vallado, P.~Crawford, R.~Hujsak, and T.~S.~Kelso,
+``Revisiting Spacetrack Report \#3,''
+in \emph{Proc. AIAA/AAS Astrodynamics Specialist Conf.},
+Keystone, CO, AIAA~2006-6753, 2006.
+
+\bibitem{foster1992}
+J.~L.~Foster and H.~S.~Estes,
+``A Parametric Analysis of Orbital Debris Collision Probability
+  and Maneuver Rate for Space Vehicles,''
+NASA/JSC-25898, 1992.
+
+\bibitem{chan1997}
+F.~K.~Chan,
+``Spacecraft Collision Probability,''
+\emph{J.~Guidance, Control, Dyn.},
+vol.~20, no.~3, pp.~566--571, 1997.
+
+\bibitem{johnson2001}
+N.~L.~Johnson, P.~H.~Krisko, J.-C.~Liou, and P.~D.~Anz-Meador,
+``NASA's New Breakup Model of EVOLVE~4.0,''
+\emph{Adv.~Space Res.}, vol.~28, no.~9, pp.~1377--1384, 2001.
+
+\bibitem{alfriend1999}
+K.~T.~Alfriend, M.~R.~Akella, J.~Frisbee, J.~L.~Foster,
+D.~J.~Lee, and M.~Wilkins,
+``Probability of Collision Error Analysis,''
+\emph{Space Debris}, vol.~1, no.~1, pp.~21--35, 1999.
+
+\bibitem{akella2000}
+M.~R.~Akella and K.~T.~Alfriend,
+``Probability of Collision Between Space Objects,''
+\emph{J.~Guidance, Control, Dyn.}, vol.~23, no.~5, pp.~769--772, 2000.
+
+\bibitem{battin1999}
+R.~H.~Battin,
+\emph{An Introduction to the Mathematics and Methods of Astrodynamics},
+revised ed.
+AIAA Education Series, 1999.
+
+\bibitem{orbital_sentinel_repo}
+Orbital Sentinel repository: \texttt{README.md},
+\texttt{FEATURES\_MATH\_LOGIC.md}, \texttt{PROJECT\_OVERVIEW.txt},
+source files inspected in the supplied workspace, accessed Sept.\ 2026.
+
+\bibitem{orbital_sentinel_metrics}
+Orbital Sentinel \texttt{model\_metrics\_cache.json},
+synthetic evaluation artifact, generated 8~May~2026.
+
+\end{thebibliography}
+
+\end{document}
