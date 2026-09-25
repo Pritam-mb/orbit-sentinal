@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import useStore from '../store/useStore';
 
-const AGENCIES = ['All', 'SpaceX', 'ESA', 'ISRO', 'ROSCOSMOS', 'ISS/NASA', 'CNSA', 'US Space Force', 'NOAA', 'NASA'];
+const DEFAULT_AGENCIES = ['SpaceX', 'ISS', 'Roscosmos', 'CNSA', 'NOAA', 'NASA', 'Iridium'];
 
 export default function Header() {
   const satellites = useStore((s) => s.satellites);
@@ -29,6 +29,14 @@ export default function Header() {
   const maxCpi = alerts.length > 0
     ? Math.max(...alerts.map((a) => Number(a.cpi_score ?? 0)))
     : 0;
+
+  // Derive the agency list from the live catalog so labels always match
+  const catalogAgencies = [...new Set(
+    satellites.map((s) => s.agency).filter((a) => a && a !== 'Unknown')
+  )].sort();
+  const agencyOptions = catalogAgencies.length > 0
+    ? catalogAgencies
+    : DEFAULT_AGENCIES;
 
   const cpiClass = maxCpi >= 8 ? 'critical' : maxCpi >= 5 ? 'warning' : maxCpi > 0 ? 'nominal' : '';
   const alertClass = alerts.length > 0 ? 'alert' : '';
@@ -79,7 +87,7 @@ export default function Header() {
           onChange={handleAgencyChange}
           title="Filter by agency"
         >
-          {AGENCIES.map((a) => (
+          {['All', ...agencyOptions].map((a) => (
             <option key={a} value={a}>{a}</option>
           ))}
         </select>

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import useStore from '../store/useStore';
 
 const NODE_COLORS = {
@@ -20,10 +20,9 @@ const SPRING_K = 0.04;
 const DAMPING = 0.85;
 const CENTER_GRAVITY = 0.02;
 
-export default function CascadeDiagram({ graph = { nodes: [], edges: [] }, alerts = [] }) {
+export default function CascadeDiagram({ graph = { nodes: [], edges: [] } }) {
   const canvasRef = useRef(null);
   const simRef = useRef({ nodes: [], edges: [], animId: null });
-  const tooltipRef = useRef(null);
   const [tooltip, setTooltip] = useState(null);
   const setSelectedSatId = useStore((s) => s.setSelectedSatelliteId);
   const setSelectedAlertId = useStore((s) => s.setSelectedAlertId);

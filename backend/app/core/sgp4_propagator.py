@@ -373,6 +373,64 @@ class SGP4Propagator:
                 return self._maneuvers.pop(norad_id)
         return None
 
+    def apply_state_override(
+        self,
+        norad_id: int | str,
+        x: float,
+        y: float,
+        z: float,
+        vx: float,
+        vy: float,
+        vz: float,
+    ) -> dict:
+        """Directly replace a satellite's orbit from an ECI state vector (km, km/s)."""
+        try:
+            norad_int = int(norad_id)
+        except (TypeError, ValueError):
+            return {"status": "ERROR", "error": f"Invalid NORAD ID: {norad_id}"}
+
+        with self._lock:
+            if norad_int not in self._satellites:
+                return {"status": "ERROR", "error": f"Satellite {norad_int} not found"}
+
+        pos = [float(x), float(y), float(z)]
+        vel = [float(vx), float(vy), float(vz)]
+        try:
+            el = _state_to_keplerian(pos, vel)
+            perigee = el["a"] * (1.0 - el["e"]) - RE
+            if perigee < 100.0:
+                return {
+                    "status": "ERROR",
+                    "error": "Override rejected: perigee would drop below 100 km (reentry risk)",
+                }
+
+            epoch = datetime.now(timezone.utc)
+            prev_state = self.propagate_one(norad_int, epoch)
+            new_satrec = _rebuild_satrec(pos, vel, epoch, norad_int)
+
+            with self._lock:
+                _, name = self._satellites[norad_int]
+                self._satellites[norad_int] = (new_satrec, name)
+
+            dv_mag = 0.0
+            if prev_state is not None and prev_state.error_code == 0:
+                dv_mag = float(np.linalg.norm([
+                    vel[0] - prev_state.vx,
+                    vel[1] - prev_state.vy,
+                    vel[2] - prev_state.vz,
+                ]))
+            return {
+                "status": "success",
+                "norad_id": norad_int,
+                "applied_delta_v_ms": round(dv_mag * 1000.0, 3),
+                "new_perigee_km": float(round(float(perigee), 1)),
+                "new_apogee_km": float(round(float(el["a"] * (1.0 + el["e"]) - RE), 1)),
+                "new_inclination_deg": float(round(float(el["i"]), 3)),
+                "epoch_utc": epoch.isoformat(),
+            }
+        except ValueError as error:
+            return {"status": "ERROR", "error": str(error)}
+
     @property
     def satellite_count(self) -> int:
         with self._lock:

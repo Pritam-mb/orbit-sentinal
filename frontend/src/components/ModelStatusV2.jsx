@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { apiGet } from '../utils/api';
 
 const POLL_MS = 30_000;
@@ -22,9 +22,9 @@ export default function ModelStatusV2() {
       if (m) setMetrics(m);
       if (c) setCascadeStatus(c);
       setSampleHistory((prev) => {
-        const count = m?.xgboost?.training_samples ?? m?.training_samples ?? 0;
+        const samples = m?.classification_models?.[0]?.metrics?.samples ?? 0;
         const ts = new Date().toISOString().substring(11, 19);
-        return [...prev, { ts, count }].slice(-10);
+        return [...prev, { ts, count: samples }].slice(-10);
       });
     } catch (_) {}
   };
@@ -36,40 +36,39 @@ export default function ModelStatusV2() {
     return () => { mountedRef.current = false; clearInterval(id); };
   }, []);
 
-  const xgb = metrics?.xgboost ?? {};
-  const lstm = metrics?.lstm ?? {};
-  const gnn = metrics?.gnn ?? {};
-  const rlhf = metrics?.rlhf ?? {};
-  const meta = metrics?.meta_propagator ?? {};
+  const riskModel = (metrics?.classification_models ?? []).find((m) => m.name === 'Risk Scorer');
+  const graphModel = (metrics?.classification_models ?? []).find((m) => m.name === 'Graph Cascade');
+  const gatModel = (metrics?.classification_models ?? []).find((m) => m.name === 'GAT Cascade');
+  const trajModel = (metrics?.regression_models ?? []).find((m) => m.name === 'Trajectory Predictor');
 
-  const usingTrained = xgb.using_trained ?? false;
-  const trainSamples = xgb.training_samples ?? 0;
-  const precision = xgb.precision ?? null;
-  const recall = xgb.recall ?? null;
-  const f1 = xgb.f1 ?? null;
-  const predictions = xgb.predictions_today ?? 0;
-  const highRisk = xgb.high_risk_count ?? 0;
+  const usingTrained = (riskModel?.metrics?.samples ?? 0) > 0;
+  const trainSamples = riskModel?.metrics?.samples ?? 0;
+  const precision = riskModel?.metrics?.precision ?? null;
+  const recall = riskModel?.metrics?.recall ?? null;
+  const f1 = riskModel?.metrics?.f1 ?? null;
+  const predictions = 0;
+  const highRisk = 0;
 
-  const lstmTrained = lstm.trained ?? false;
-  const lstmSeqs = lstm.training_sequences ?? 0;
-  const lstmSats = lstm.satellites ?? 0;
-  const lstmErr = lstm.mean_error_km ?? null;
-  const bufferFill = lstm.buffer_fill ?? 0;
+  const lstmTrained = (trajModel?.metrics?.samples ?? 0) > 0;
+  const lstmSeqs = trajModel?.metrics?.samples ?? 0;
+  const lstmSats = 0;
+  const lstmErr = trajModel?.metrics?.mae ?? null;
+  const bufferFill = 0;
   const BUFFER_THRESHOLD = 500;
 
-  const gnnType = gnn.model_type ?? 'DETERMINISTIC';
-  const torchGeo = gnn.torch_geometric ?? null;
-  const cascadePred = cascadeStatus?.cascade_predictions ?? gnn.cascade_predictions ?? 0;
-  const meanDepth = cascadeStatus?.mean_cascade_depth ?? gnn.mean_cascade_depth ?? 0;
+  const gatStatus = metrics?.graph_attention ?? null;
+  const gatDegenerate = gatStatus?.degenerate !== false;
+  const cascadePred = cascadeStatus?.cascade_predictions ?? graphModel?.metrics?.samples ?? 0;
+  const meanDepth = cascadeStatus?.mean_cascade_depth ?? 0;
 
-  const rlhfDecisions = rlhf.decisions_collected ?? 0;
-  const approvalRate = rlhf.approval_rate ?? null;
-  const rlhfRounds = rlhf.rounds_completed ?? 0;
-  const rlhfRoundRates = rlhf.round_rates ?? [];
+  const rlhfDecisions = 0;
+  const approvalRate = null;
+  const rlhfRounds = 0;
+  const rlhfRoundRates = [];
 
-  const metaSats = meta.satellites_with_corrections ?? 0;
-  const metaImprovement = meta.mean_improvement_pct ?? 0;
-  const metaCorrections = meta.total_corrections ?? 0;
+  const metaSats = 0;
+  const metaImprovement = 0;
+  const metaCorrections = 0;
 
   const conjSamples = metrics?.conjunction_samples ?? trainSamples;
   const readyToRetrain = conjSamples >= BUFFER_THRESHOLD;
@@ -110,7 +109,7 @@ export default function ModelStatusV2() {
         {/* Feature importance bars */}
         <div className="msv2-feature-bars">
           {TOP_FEATURES.map((feat, i) => {
-            const imp = xgb.feature_importance?.[feat] ?? (0.35 - i * 0.06);
+            const imp = riskModel?.feature_importance?.[feat] ?? (0.35 - i * 0.06);
             return (
               <div className="msv2-feature-bar-row" key={feat}>
                 <span className="msv2-feature-name">{feat}</span>
@@ -148,16 +147,43 @@ export default function ModelStatusV2() {
 
       {/* Section 3: GNN */}
       <div className="msv2-section">
-        <div className="msv2-section-title">GNN Cascade Model</div>
-        <div className={`msv2-model-badge ${gnnType === 'GAT' ? 'trained' : 'heuristic'}`}>
-          {gnnType === 'GAT' ? '● GAT' : '◌ DETERMINISTIC'}
+        <div className="msv2-section-title">Graph Cascade Models</div>
+        <div className={`msv2-model-badge ${gatDegenerate ? 'heuristic' : 'trained'}`}>
+          {gatDegenerate ? '◌ GAT DEGENERATE' : '● GAT ATTENTION'}
+        </div>
+        {gatDegenerate && (
+          <div className="msv2-row">
+            <span>GAT is not an independent model</span>
+            <span style={{ color: 'var(--alert-red)' }}>ALIASES GNN</span>
+          </div>
+        )}
+        <div className="msv2-row">
+          <span>Attention trainer</span>
+          <span>{gatStatus?.trainer ?? 'unavailable'}</span>
         </div>
         <div className="msv2-row">
-          <span>torch-geometric</span>
-          <span className={torchGeo ? '' : ''} style={{ color: torchGeo ? 'var(--alert-green)' : 'var(--text-dim)' }}>
-            {torchGeo ? `INSTALLED ${torchGeo}` : 'NOT INSTALLED'}
+          <span>Heads / hidden dim</span>
+          <span>
+            {gatStatus?.heads != null && gatStatus?.hidden_dim != null
+              ? `${gatStatus.heads} / ${gatStatus.hidden_dim}`
+              : 'n/a'}
           </span>
         </div>
+        {gatModel?.metrics?.accuracy != null && (
+          <div className="msv2-row">
+            <span>GAT accuracy</span>
+            <span>
+              {gatModel.metrics.accuracy.toFixed(4)}
+              {gatModel.independent === false ? ' (aliased)' : ''}
+            </span>
+          </div>
+        )}
+        {graphModel?.metrics?.accuracy != null && (
+          <div className="msv2-row">
+            <span>GNN accuracy</span>
+            <span>{graphModel.metrics.accuracy.toFixed(4)}</span>
+          </div>
+        )}
         <div className="msv2-row"><span>Cascade predictions</span><span>{cascadePred}</span></div>
         <div className="msv2-row"><span>Mean cascade depth</span><span>{Number(meanDepth).toFixed(1)}</span></div>
       </div>

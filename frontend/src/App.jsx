@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, Suspense } from 'react';
+import { useEffect, useRef, Suspense } from 'react';
 import CesiumGlobe from './components/Globe/CesiumGlobe';
 import ThreatGlobe from './components/ThreatGlobe';
 import Header from './components/Header';
@@ -11,7 +11,6 @@ import ModelStatusV2 from './components/ModelStatusV2';
 import SimulationDrawer from './components/SimulationDrawer';
 import MetricsDrawer from './components/MetricsDrawer';
 import useStore from './store/useStore';
-import useTestMode from './hooks/useTestMode';
 import { buildCascadeGraph } from './utils/cascadeGraph';
 import './App.css';
 
@@ -43,16 +42,13 @@ function App() {
   const setModelMetrics      = useStore((s) => s.setModelMetrics);
   const setWsConnected       = useStore((s) => s.setWsConnected);
   const setCascadeGraph      = useStore((s) => s.setCascadeGraph);
+  const setRankerReview      = useStore((s) => s.setRankerReview);
 
   const satellites        = useStore((s) => s.satellites);
   const alerts            = useStore((s) => s.alerts);
-  const wsConnected       = useStore((s) => s.wsConnected);
   const selectedSatelliteId = useStore((s) => s.selectedSatelliteId);
   const setSelectedSatelliteId = useStore((s) => s.setSelectedSatelliteId);
-  const selectedAlertId   = useStore((s) => s.selectedAlertId);
   const agencyFilter      = useStore((s) => s.agencyFilter);
-  const simTimeOffset     = useStore((s) => s.simTimeOffset);
-  const debrisFragments   = useStore((s) => s.debrisFragments);
   const cascadeGraph      = useStore((s) => s.cascadeGraph);
 
   const wsRef = useRef(null);
@@ -97,8 +93,9 @@ function App() {
             cpi_threshold: data.cpi_threshold || 5.0,
             node_probabilities: data.node_probabilities || {},
           });
+          setRankerReview(data.ranker_review || {});
           setHotspots(data.hotspots || []);
-          setDebrisClouds(data.debris_clouds || []);
+          setDebrisClouds(data.debris_clouds || [], data.debris_sources || ['forecast', 'fragment']);
         }
       } catch (e) {
         console.error('Alert bootstrap failed:', e);
@@ -133,11 +130,26 @@ function App() {
           if (data.type === 'update') {
             setSnapshotTimestamp(data.timestamp || null);
             setSatellites(data.satellites || []);
+            if (Object.prototype.hasOwnProperty.call(data, 'debris_clouds')) {
+              setDebrisClouds(data.debris_clouds || [], data.debris_sources || null);
+            }
+            // The server attaches the alert block only when the alert cache
+            // changes, so absence means "unchanged" and must not clear state.
             if (Object.prototype.hasOwnProperty.call(data, 'alerts')) {
               setAlerts(data.alerts || []);
-            }
-            if (Object.prototype.hasOwnProperty.call(data, 'debris_clouds')) {
-              setDebrisClouds(data.debris_clouds || []);
+              setHotspots(data.hotspots || []);
+              setCascadePlan({
+                graph: data.graph || {},
+                alerts: data.alerts || [],
+                cascade_plan: data.cascade_plan || [],
+                total_delta_v_ms: data.total_delta_v_ms || 0,
+                cascade_depth: data.cascade_depth || 0,
+                agencies_involved: data.agencies_involved || [],
+                seed_satellites: data.seed_satellites || [],
+                cpi_threshold: data.cpi_threshold || 5.0,
+                node_probabilities: data.node_probabilities || {},
+              });
+              setRankerReview(data.ranker_review || {});
             }
           }
         } catch (e) {
@@ -169,7 +181,7 @@ function App() {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setHotspots, setDebrisClouds, setModelMetrics, setWsConnected]);
+  }, [setSatellites, setSnapshotTimestamp, setAlerts, setCascadePlan, setHotspots, setDebrisClouds, setModelMetrics, setWsConnected, setRankerReview]);
 
   // ── Build cascade graph whenever alerts change ─────────────────────────────
   useEffect(() => {
@@ -219,7 +231,7 @@ function App() {
       {/* Row 4: Bottom three panels */}
       <div className="bottom-grid">
         <UplinkDownlinkV2 selectedSatId={selectedSatelliteId} />
-        <CascadeDiagram graph={cascadeGraph} alerts={alerts} />
+        <CascadeDiagram graph={cascadeGraph} />
         <ModelStatusV2 />
       </div>
 

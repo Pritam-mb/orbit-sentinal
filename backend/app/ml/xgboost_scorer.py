@@ -1,9 +1,11 @@
 """
 xgboost_scorer.py — Collision risk scorer backed by a Foster-trained XGBoost model.
 
-On module import, attempts to load a previously trained model from
-risk_model_trained.json. If not found, triggers training via train_xgboost.py
-(which generates Foster B-plane data and trains XGBoost — ~1–3 min first run).
+Nothing is loaded or trained at import time. The heavy Foster-trained model in
+risk_model_trained.json is loaded on first use *and only when the extended ML
+pipeline is enabled* (ENABLE_EXTENDED_PIPELINE=1); otherwise scoring uses the
+cheap boosted-stump heuristic. The bootstrap model is loaded lazily on first
+score as well, so constructing a scorer is free.
 
 Falls back to the legacy boosted-stump heuristic if XGBoost is unavailable.
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,27 +41,69 @@ logger = logging.getLogger(__name__)
 RISK_ARTIFACT = "risk_model.json"
 RISK_ARTIFACT_JOBLIB = "risk_model.joblib"
 
-# ── Module-level trained model (loaded once on import) ────────────────────────
+
+def _extended_pipeline_enabled() -> bool:
+    """Mirror of main.ENABLE_EXTENDED_PIPELINE, read lazily so tests can patch it."""
+    return os.getenv("ENABLE_EXTENDED_PIPELINE", "0") == "1"
+
+
+def active_risk_model_path() -> str:
+    """
+    Identify which model scoring will actually use right now.
+
+    Reported by the metrics endpoint so the numbers shown in the UI describe
+    the deployed scorer rather than a parallel evaluation of a different model.
+    """
+    if not _extended_pipeline_enabled():
+        return "boosted-stump"
+    if _using_trained and _trained_model is not None:
+        return "foster-xgboost"
+    return "boosted-stump"
+
+
+# ── Module-level trained model (loaded on first use, flag-gated) ─────────────
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _TRAINED_MODEL_PATH = os.path.join(_MODULE_DIR, "risk_model_trained.json")
 
 _trained_model = None
 _using_trained = False
+_trained_model_loaded = False
+_trained_model_lock = threading.Lock()
 
-if xgb is not None:
-    try:
-        from app.ml.train_xgboost import load_or_train as _load_or_train
-        _trained_model = _load_or_train(_TRAINED_MODEL_PATH)
-        _using_trained = True
-        print("XGBoost: loaded trained Foster model")
-        logger.info("XGBoost risk model loaded from %s", _TRAINED_MODEL_PATH)
-    except Exception as _xgb_init_err:
-        _trained_model = None
-        _using_trained = False
-        print(f"XGBoost: falling back to heuristic ({_xgb_init_err})")
-        logger.warning("XGBoost model load/train failed: %s", _xgb_init_err)
-else:
-    print("XGBoost: library not installed — using heuristic fallback")
+
+def _ensure_trained_model() -> None:
+    """
+    Lazily load (or train) the Foster XGBoost model on first use.
+
+    Loading is deferred so that merely importing this module has no side
+    effects: no model is read, no training is triggered, and no artifacts are
+    written until a score is actually requested. This lets the ML stack be
+    gated behind a feature flag instead of running on every process start.
+    """
+    global _trained_model, _using_trained, _trained_model_loaded
+
+    if _trained_model_loaded:
+        return
+
+    with _trained_model_lock:
+        if _trained_model_loaded:
+            return
+
+        if xgb is None:
+            logger.info("XGBoost library not installed - using heuristic fallback")
+        else:
+            try:
+                from app.ml.train_xgboost import load_or_train as _load_or_train
+
+                _trained_model = _load_or_train(_TRAINED_MODEL_PATH)
+                _using_trained = True
+                logger.info("XGBoost risk model loaded from %s", _TRAINED_MODEL_PATH)
+            except Exception as _xgb_init_err:
+                _trained_model = None
+                _using_trained = False
+                logger.warning("XGBoost model load/train failed: %s", _xgb_init_err)
+
+        _trained_model_loaded = True
 
 
 # ── Legacy boosted-stump model (fallback) ─────────────────────────────────────
@@ -352,7 +397,17 @@ class XGBoostScorer:
     def __init__(self, model_path: str = None):
         self.model: BoostedRiskModel | None = None
         self.model_path = model_path
-        self._load_or_train_model(model_path)
+        # Bootstrapping is deferred: constructing a scorer must not load or
+        # train anything, because scorers are built at import time by the
+        # cascade planner regardless of the ML feature flag.
+        self._bootstrap_lock = threading.Lock()
+
+    def _ensure_bootstrap_model(self) -> None:
+        if self.model is not None:
+            return
+        with self._bootstrap_lock:
+            if self.model is None:
+                self._load_or_train_model(self.model_path)
 
     def _load_or_train_model(self, path: str | None):
         try:
@@ -422,10 +477,14 @@ class XGBoostScorer:
         """
         Score collision risk from 0.0 (safe) to 1.0 (critical).
 
-        Primary path: Foster-trained XGBoost model.
+        Primary path: Foster-trained XGBoost model, used only when the extended
+        ML pipeline is enabled.
         Fallback: legacy boosted-stump heuristic.
         """
-        # ── Primary path: Foster-trained XGBoost ──────────────────────────
+        # ── Primary path: Foster-trained XGBoost (flag-gated) ────────────────
+        if _extended_pipeline_enabled():
+            _ensure_trained_model()
+
         if _using_trained and _trained_model is not None and xgb is not None:
             try:
                 if isinstance(features, dict):
@@ -443,8 +502,7 @@ class XGBoostScorer:
                 )
 
         # ── Fallback: legacy boosted-stump heuristic ───────────────────────
-        if self.model is None:
-            self._load_or_train_model(self.model_path)
+        self._ensure_bootstrap_model()
 
         if isinstance(features, dict):
             row = np.asarray(self.extract_features(features), dtype=float)

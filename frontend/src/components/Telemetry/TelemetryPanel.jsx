@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import useStore from '../../store/useStore';
 import { eciToLla, generateKeplerianOrbit } from '../../utils/coords';
 
@@ -46,7 +46,6 @@ const TelemetryPanel = () => {
   useEffect(() => {
     let cancelled = false;
     let detailTimer = null;
-    let orbitTimer = null;
 
     const loadSelectedSatellite = async () => {
       if (cancelled || detailFetchInFlight.current) return;

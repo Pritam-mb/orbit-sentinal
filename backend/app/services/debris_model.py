@@ -171,7 +171,7 @@ def build_debris_alerts(
         return []
 
     tree = cKDTree(np.array(positions, dtype=float))
-    alerts: list[dict[str, Any]] = []
+    cloud_alerts: list[dict[str, Any]] = []
 
     for idx, hotspot in enumerate(hotspots[:8]):
         cpi_score = float(hotspot.get("cpi_score", 0.0))
@@ -255,6 +255,6 @@ def build_debris_alerts(
             shells=shells,
         )
 
-        alerts.append(cloud.__dict__)
+        cloud_alerts.append(cloud.__dict__)
 
-    return alerts
+    return cloud_alerts

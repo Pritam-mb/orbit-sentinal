@@ -59,7 +59,7 @@ export function buildCascadeGraph(alerts) {
         id: alert.id ?? `${aId}-${bId}`,
         source: aId,
         target: bId,
-        p_collision: Number(alert.p_collision ?? alert.probability ?? 0),
+        p_collision: Number(alert.p_collision ?? alert.probability_of_collision ?? alert.probability ?? 0),
         miss_distance: Number(alert.miss_distance_km ?? 0),
         tca_hours: tcaHours,
         tca_utc: alert.tca_utc ?? null,

@@ -13,6 +13,7 @@ const useStore = create((set, get) => ({
   cascadePlan: null,
   hotspots: [],
   debrisClouds: [],
+  debrisBySource: {},
   modelMetrics: null,
   simulationDrawerOpen: true,
   metricsDrawerOpen: true,
@@ -36,6 +37,7 @@ const useStore = create((set, get) => ({
   dataAgeSeconds: 0,
   debrisFragments: [],
   cascadeGraph: { nodes: [], edges: [] },
+  rankerReview: {},
   decisionLog: [],
 
   // ── Existing actions ─────────────────────────────────────────────────────────
@@ -63,7 +65,45 @@ const useStore = create((set, get) => ({
 
   setHotspots: (hotspots) => set({ hotspots }),
 
-  setDebrisClouds: (debrisClouds) => set({ debrisClouds }),
+  /**
+   * Debris clouds arrive from two independent backend sources that refresh on
+   * different cadences:
+   *   - 'fragment' clouds come from the core EVOLVE model and are pushed on
+   *     every 1 Hz position frame because their radii grow continuously.
+   *   - 'forecast' clouds come from the alert planner and only change when the
+   *     alert cache is recomputed.
+   *
+   * Replacing the whole list on every frame would drop whichever source did not
+   * ride along with that frame, so the two are stored separately and merged on
+   * read. `sources` names the sources this payload actually carries: those are
+   * replaced outright (including being cleared when empty), and any source it
+   * omits is carried forward untouched. When `sources` is not supplied the
+   * payload is treated as authoritative for every source it mentions.
+   */
+  setDebrisClouds: (incoming, sources = null) =>
+    set((state) => {
+      const next = {};
+      const present = new Set();
+      for (const cloud of incoming || []) {
+        const source = cloud?.debris_source || 'fragment';
+        present.add(source);
+        (next[source] ||= []).push(cloud);
+      }
+      // A named-but-empty source is a clear signal, not an absence.
+      for (const source of sources || []) {
+        if (!present.has(source)) next[source] = [];
+      }
+      for (const [source, clouds] of Object.entries(state.debrisBySource || {})) {
+        if (!(source in next)) next[source] = clouds;
+      }
+      const debrisBySource = next;
+      return {
+        debrisBySource,
+        debrisClouds: Object.values(debrisBySource).flat(),
+      };
+    }),
+
+  resetDebrisClouds: () => set({ debrisBySource: {}, debrisClouds: [] }),
 
   setModelMetrics: (modelMetrics) => set({ modelMetrics }),
 
@@ -96,6 +136,8 @@ const useStore = create((set, get) => ({
   setDebrisFragments: (f) => set({ debrisFragments: f }),
 
   setCascadeGraph: (g) => set({ cascadeGraph: g }),
+
+  setRankerReview: (r) => set({ rankerReview: r || {} }),
 
   addDecisionLogEntry: (e) =>
     set((state) => ({

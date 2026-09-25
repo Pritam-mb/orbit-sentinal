@@ -86,43 +86,100 @@ async def satellite_broadcast_loop(
     conjunction alerts. Field is None for non-threatened satellites and
     contains ellipse parameters {a, b, angle, affection_rate, predicted_fragments}
     for satellites in active conjunctions.
+
+    Alerts, hotspots and the cascade plan are refreshed on a much slower cadence
+    than the position stream, so they are attached to the broadcast only when
+    the alert cache timestamp actually changes. This keeps the 1 Hz payload small
+    while still pushing a new alert set to the UI as soon as it is computed,
+    instead of waiting for the frontend's REST poll.
     """
+    last_alerts_stamp: str | None = None
+
     while True:
         try:
             if manager.active_connections:
                 snapshot = get_latest_snapshot()
 
-                # Build covariance index from active alerts
                 try:
                     alerts_snapshot = get_latest_alerts()
-                    active_alerts = alerts_snapshot.get("alerts", [])
-                    covariance_index = _build_covariance_index(active_alerts)
                 except Exception:
-                    covariance_index = {}
+                    logger.debug("Alert cache unavailable for broadcast", exc_info=True)
+                    alerts_snapshot = {}
 
-                # Build enriched satellite list
+                active_alerts = alerts_snapshot.get("alerts", [])
+                covariance_index = _build_covariance_index(active_alerts)
+                alerts_stamp = alerts_snapshot.get("timestamp")
+
                 satellites = snapshot.get("satellites", [])
                 if covariance_index:
-                    enriched = []
-                    for sat in satellites:
-                        norad_str = str(sat.get("norad_id", ""))
-                        covariance_ellipse = covariance_index.get(norad_str, None)
-                        enriched.append({**sat, "covariance_ellipse": covariance_ellipse})
-                    payload_obj = {
-                        "type": snapshot.get("type", "update"),
-                        "timestamp": snapshot.get("timestamp"),
-                        "satellites": enriched,
-                        "count": snapshot.get("count", len(satellites)),
-                        "debris_clouds": snapshot.get("debris_clouds", []),
-                    }
-                    payload = json.dumps(payload_obj, separators=(",", ":"))
-                else:
-                    # No active conjunctions -- use cached payload (faster)
-                    payload = snapshot.get("payload")
+                    satellites = [
+                        {
+                            **sat,
+                            "covariance_ellipse": covariance_index.get(
+                                str(sat.get("norad_id", "")), None
+                            ),
+                        }
+                        for sat in satellites
+                    ]
 
-                if payload:
-                    await manager.broadcast(payload)
+                payload_obj = {
+                    "type": snapshot.get("type", "update"),
+                    "timestamp": snapshot.get("timestamp"),
+                    "satellites": satellites,
+                    "count": snapshot.get("count", len(satellites)),
+                }
 
+                # Fragment clouds from the core EVOLVE model. These radii grow
+                # every second as fragments propagate, so they ride along on
+                # every position frame. `debris_sources` names which sources
+                # this frame actually carries, so the client can clear a source
+                # that has emptied without wiping one that is merely absent.
+                fragment_clouds = [
+                    {**cloud, "debris_source": "fragment"}
+                    for cloud in snapshot.get("debris_clouds", []) or []
+                ]
+                payload_obj["debris_sources"] = ["fragment"]
+                if fragment_clouds:
+                    payload_obj["debris_clouds"] = fragment_clouds
+
+                # The alert set is refreshed far more slowly than the position
+                # stream, so it is attached only when the cache stamp changes.
+                # This keeps the 1 Hz payload small while still pushing a new
+                # alert set as soon as it is computed, and it lets the frontend
+                # tell "alerts cleared" apart from "alerts unchanged".
+                if alerts_stamp != last_alerts_stamp:
+                    last_alerts_stamp = alerts_stamp
+                    forecast_clouds = [
+                        {**cloud, "debris_source": "forecast"}
+                        for cloud in alerts_snapshot.get("debris_clouds", []) or []
+                    ]
+                    payload_obj["debris_sources"].append("forecast")
+                    # Merge with this frame's fragment clouds. The client keeps
+                    # the two sources separate, so a tick without forecast clouds
+                    # does not erase them.
+                    payload_obj["debris_clouds"] = [
+                        *forecast_clouds,
+                        *fragment_clouds,
+                    ]
+                    payload_obj.update(
+                        {
+                            "alerts": active_alerts,
+                            "alert_count": len(active_alerts),
+                            "hotspots": alerts_snapshot.get("hotspots", []),
+                            "cascade_plan": alerts_snapshot.get("cascade_plan", []),
+                            "cascade_depth": alerts_snapshot.get("cascade_depth", 0),
+                            "graph": alerts_snapshot.get("graph", {}),
+                            "ranker_review": alerts_snapshot.get("ranker_review", {}),
+                            "alerts_timestamp": alerts_stamp,
+                        }
+                    )
+
+                await manager.broadcast(
+                    json.dumps(payload_obj, separators=(",", ":"))
+                )
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Broadcast error: {e}")
 

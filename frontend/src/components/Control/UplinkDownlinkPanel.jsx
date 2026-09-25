@@ -20,11 +20,6 @@ const DIRECTIONS = [
 
 export default function UplinkDownlinkPanel() {
   const selectedSatId = useStore((s) => s.selectedSatelliteId)
-  const satellites = useStore((s) => s.satellites)
-  const selectedSat = satellites.find(
-    s => s.norad_id === selectedSatId ||
-         s.id === selectedSatId
-  )
 
   const [telemetry, setTelemetry] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -54,7 +49,7 @@ export default function UplinkDownlinkPanel() {
           setTelemetry(data)
           setError(null)
         }
-      } catch (e) {
+      } catch (_e) {
         setError("Telemetry offline")
       } finally {
         setLoading(false)
@@ -94,7 +89,7 @@ export default function UplinkDownlinkPanel() {
         message: result.result?.message ?? "Sent"
       }
       setCmdLog(prev => [entry, ...prev].slice(0, 20))
-    } catch (e) {
+    } catch (_e) {
       setCmdLog(prev => [{
         id: Date.now(),
         time: new Date().toLocaleTimeString(),

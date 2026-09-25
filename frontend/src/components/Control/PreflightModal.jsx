@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 const GATE_LABELS = {
   trajectory_clear: 'Trajectory Clear (24h)',
@@ -13,8 +13,11 @@ const PreflightModal = ({ noradId, maneuver, onConfirm, onCancel }) => {
   const apiBaseUrl = '';
   const [preflight, setPreflight] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     const runCheck = async () => {
       try {
         const resp = await fetch(`${apiBaseUrl}/api/preflight`, {
@@ -27,30 +30,47 @@ const PreflightModal = ({ noradId, maneuver, onConfirm, onCancel }) => {
             dvz: maneuver.dvz,
           }),
         });
+
+        if (!resp.ok) {
+          throw new Error(`preflight request failed with status ${resp.status}`);
+        }
+
         const data = await resp.json();
+        if (cancelled) return;
         setPreflight(data);
+        setError(null);
       } catch (e) {
         console.error('Preflight check failed:', e);
-        // Fallback: all gates pass
+        if (cancelled) return;
+        // Fail closed: an unreachable validator must never enable a burn.
+        setError(
+          e?.message
+            ? `Preflight validation unavailable: ${e.message}`
+            : 'Preflight validation unavailable.'
+        );
         setPreflight({
           dv_magnitude_ms: Math.sqrt(
             maneuver.dvx ** 2 + maneuver.dvy ** 2 + maneuver.dvz ** 2
           ).toFixed(3),
           gates: {
-            trajectory_clear: true,
-            fuel_budget: true,
-            agency_auth: true,
-            tca_window: true,
-            physical_limits: true,
-            sim_dryrun: true,
+            trajectory_clear: false,
+            fuel_budget: false,
+            agency_auth: false,
+            tca_window: false,
+            physical_limits: false,
+            sim_dryrun: false,
           },
-          all_clear: true,
+          all_clear: false,
         });
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-      setLoading(false);
     };
 
     runCheck();
+    return () => {
+      cancelled = true;
+    };
   }, [noradId, maneuver]);
 
   if (loading) {
@@ -68,6 +88,12 @@ const PreflightModal = ({ noradId, maneuver, onConfirm, onCancel }) => {
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>Pre-Flight Validation</h2>
+
+        {error && (
+          <div className="error-banner" style={{ marginBottom: 12 }}>
+            {error}
+          </div>
+        )}
 
         <div style={{ marginBottom: 12 }}>
           <span className="telemetry-label">ΔV Magnitude</span>

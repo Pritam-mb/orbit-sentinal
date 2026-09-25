@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone
 from app.core.sgp4_propagator import SGP4Propagator
 from app.core.conjunction import WARNING_DISTANCE_KM, find_tca
+from app.core.agency import AGENCY_ALIASES as _AGENCY_ALIASES, infer_agency as _infer_shared_agency
 
 try:
     from app.core.agency_authority import authority_manager
@@ -20,18 +21,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-AGENCY_ALIASES = [
-    ("STARLINK", "SpaceX"),
-    ("SPACEX", "SpaceX"),
-    ("ISS", "ISS"),
-    ("COSMOS", "Roscosmos"),
-    ("RESURS", "Roscosmos"),
-    ("FENGYUN", "CNSA"),
-    ("YAOGAN", "CNSA"),
-    ("NOAA", "NOAA"),
-    ("HUBBLE", "NASA"),
-    ("IRIDIUM", "Iridium"),
-]
+AGENCY_ALIASES = _AGENCY_ALIASES
 
 SCENARIOS_DIR = os.path.join(os.path.dirname(__file__))
 
@@ -43,13 +33,10 @@ class SimEngine:
         self.propagator = propagator
         self.active_scenario = None
         self._scenario_sats = []
+        self._scenario_backup = {}
 
     def _infer_agency(self, name: str) -> str:
-        upper_name = (name or "").upper()
-        for keyword, agency in AGENCY_ALIASES:
-            if keyword in upper_name:
-                return agency
-        return "Unknown"
+        return _infer_shared_agency(name)
 
     def _clone_propagator(self) -> SGP4Propagator:
         clone = SGP4Propagator()
@@ -117,31 +104,39 @@ class SimEngine:
         with open(path, "r") as f:
             scenario = json.load(f)
 
-        # Inject scenario satellites into the propagator
+        # Inject scenario satellites on top of the existing catalog (do NOT wipe)
         tle_list = scenario.get("satellites", [])
         if tle_list:
-            self.propagator.load_tles(
-                self.propagator._satellites
-                and [
-                    {
-                        "name": name,
-                        "norad_id": nid,
-                        "line1": sat.tle_line1 if hasattr(sat, 'tle_line1') else "",
-                        "line2": sat.tle_line2 if hasattr(sat, 'tle_line2') else "",
-                    }
-                    for nid, (sat, name) in self.propagator._satellites.items()
-                ]
-                or []
-            )
-            # Add scenario sats on top
-            for tle in tle_list:
-                from sgp4.api import Satrec, WGS72
-                try:
-                    sat = Satrec.twoline2rv(tle["line1"], tle["line2"], WGS72)
-                    self.propagator._satellites[tle["norad_id"]] = (sat, tle["name"])
-                    self._scenario_sats.append(tle["norad_id"])
-                except Exception as e:
-                    logger.warning(f"Failed to load scenario sat: {e}")
+            from sgp4.api import Satrec, WGS72
+            with self.propagator._lock:
+                for tle in tle_list:
+                    try:
+                        sat = Satrec.twoline2rv(tle["line1"], tle["line2"], WGS72)
+                        nid = tle["norad_id"]
+                        if nid in self.propagator._satellites and nid not in self._scenario_sats:
+                            self._scenario_backup[nid] = self.propagator._satellites[nid]
+                        self.propagator._satellites[nid] = (sat, tle["name"])
+                        self._scenario_sats.append(nid)
+                    except Exception as e:
+                        logger.warning(f"Failed to load scenario sat: {e}")
+
+            # Honor spatial offsets so scenario descriptions match reality
+            inject_offset = scenario.get("inject_offset_km") or {}
+            if inject_offset:
+                bravo = next((t for t in tle_list if "bravo" in (t.get("name") or "").lower()), None)
+                if bravo is not None:
+                    try:
+                        state = self.propagator.propagate_one(bravo["norad_id"])
+                        if state is not None and state.error_code == 0:
+                            self.propagator.apply_state_override(
+                                bravo["norad_id"],
+                                state.x + float(inject_offset.get("sat_bravo_dx", 0.0)),
+                                state.y + float(inject_offset.get("sat_bravo_dy", 0.0)),
+                                state.z + float(inject_offset.get("sat_bravo_dz", 0.0)),
+                                state.vx, state.vy, state.vz,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to apply scenario offset: {e}")
 
         self.active_scenario = scenario
         logger.info(f"Loaded scenario: {scenario.get('name', scenario_name)}")
@@ -155,9 +150,13 @@ class SimEngine:
 
     def clear_scenario(self):
         """Remove scenario satellites from the propagator."""
-        for nid in self._scenario_sats:
-            self.propagator._satellites.pop(nid, None)
+        with self.propagator._lock:
+            for nid in self._scenario_sats:
+                self.propagator._satellites.pop(nid, None)
+            for nid, entry in self._scenario_backup.items():
+                self.propagator._satellites[nid] = entry
         self._scenario_sats.clear()
+        self._scenario_backup.clear()
         self.active_scenario = None
         logger.info("Scenario cleared")
 
@@ -168,12 +167,19 @@ class SimEngine:
         dvy: float,
         dvz: float,
         frame: str = "RSW",
+        session_id: str = "DEMO_SESSION",
     ) -> dict:
         """
         Apply a delta-V impulse maneuver.
         Returns validation results.
+
+        The session id is forwarded to the pre-flight authority gate; it used to
+        be dropped here, which silently downgraded every maneuver to
+        DEMO_SESSION and made the agency authorization model inert.
         """
-        preflight = self.preflight_check(norad_id, dvx, dvy, dvz)
+        preflight = self.preflight_check(
+            norad_id, dvx, dvy, dvz, frame=frame, session_id=session_id
+        )
 
         if not all(preflight["gates"].values()):
             return {

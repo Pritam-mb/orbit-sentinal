@@ -1,6 +1,6 @@
-import React from 'react';
 import useStore from '../store/useStore';
 import TestModePanel from './TestModePanel';
+import ConjunctionPredictor from './ConjunctionPredictor';
 import ConjunctionMonitor from './ConjunctionMonitor';
 import ManualControl from './Control/ManualControl';
 
@@ -34,6 +34,7 @@ export default function SimulationDrawer() {
       </div>
 
       <div className="simulation-drawer-body">
+        <ConjunctionPredictor />
         <TestModePanel />
         <ConjunctionMonitor />
         <ManualControl />

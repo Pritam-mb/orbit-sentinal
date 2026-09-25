@@ -11,11 +11,22 @@ from typing import Iterable
 
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.optimize import minimize_scalar
 
 MU_EARTH_KM3_S2 = 398600.4418
 R_EARTH_KM = 6378.137
 J2_EARTH = 1.08262668e-3
+
+# A conjunction is only "confirmed" once the miss distance is at or below this
+# hard contact gate. Debris clouds are generated exclusively for confirmed
+# collisions; wider bands are warnings only.
 COLLISION_THRESHOLD_M = 1.0
+
+# Report band: inside this range a full conjunction report is built and the
+# approach is classified as a warning. This is intentionally much wider than
+# COLLISION_THRESHOLD_M, so a multi-kilometre near miss is reported and given a
+# cascade plan, but never produces debris.
+CONJUNCTION_REPORT_DISTANCE_M = 5000.0
 
 
 @dataclass
@@ -103,6 +114,143 @@ def _rk45_propagate(
     return positions, velocities
 
 
+def _build_time_grid(total_seconds: float, step_seconds: float, max_steps: int) -> np.ndarray:
+    """
+    Build the sampling grid for a propagation window.
+
+    Guarantees:
+      * the final sample is exactly `total_seconds`, so the requested target
+        time is always covered;
+      * at most `max_steps` samples are produced.
+    """
+    if total_seconds <= 0.0:
+        return np.array([0.0], dtype=float)
+
+    max_steps = max(2, int(max_steps))
+    step_seconds = max(float(step_seconds), 1e-6)
+
+    # Uniform samples strictly inside the window, capped so that the exact
+    # target can always be appended as the final node.
+    interior = int(np.floor(total_seconds / step_seconds))
+    interior = min(interior, max_steps - 2)
+    grid = np.arange(interior + 1, dtype=float) * step_seconds
+    grid = grid[grid < total_seconds]
+
+    if grid.size == 0:
+        return np.array([0.0, total_seconds], dtype=float)
+
+    if not np.isclose(grid[-1], total_seconds, rtol=0.0, atol=1e-9):
+        grid = np.append(grid, total_seconds)
+
+    return grid
+
+
+def _hermite_eval(
+    t_query: np.ndarray,
+    nodes: np.ndarray,
+    positions: np.ndarray,
+    velocities: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Evaluate a piecewise cubic Hermite interpolant of position and velocity.
+
+    Node positions/velocities are the RK45 samples, so the interpolant is
+    C1-continuous across every node and reproduces the integrated state
+    exactly at the nodes.
+    """
+    t_query = np.atleast_1d(np.asarray(t_query, dtype=float))
+    out_pos = np.zeros((t_query.size, 3), dtype=float)
+    out_vel = np.zeros((t_query.size, 3), dtype=float)
+
+    for idx in range(len(nodes) - 1):
+        t0 = float(nodes[idx])
+        t1 = float(nodes[idx + 1])
+        mask = (t_query >= t0) & (t_query <= t1)
+        if not np.any(mask):
+            continue
+
+        h = t1 - t0
+        if h <= 0.0:
+            continue
+
+        s = (t_query[mask] - t0) / h
+        s2 = s * s
+        s3 = s2 * s
+
+        h00 = 2.0 * s3 - 3.0 * s2 + 1.0
+        h10 = s3 - 2.0 * s2 + s
+        h01 = -2.0 * s3 + 3.0 * s2
+        h11 = s3 - s2
+
+        p0 = positions[idx]
+        v0 = velocities[idx]
+        p1 = positions[idx + 1]
+        v1 = velocities[idx + 1]
+
+        out_pos[mask] = (
+            h00[:, None] * p0
+            + (h10 * h)[:, None] * v0
+            + h01[:, None] * p1
+            + (h11 * h)[:, None] * v1
+        )
+        out_vel[mask] = (
+            ((6.0 * s2 - 6.0 * s) / h)[:, None] * p0
+            + (3.0 * s2 - 4.0 * s + 1.0)[:, None] * v0
+            + ((-6.0 * s2 + 6.0 * s))[:, None] * p1
+            + (3.0 * s2 - 2.0 * s)[:, None] * v1
+        )
+
+    return out_pos, out_vel
+
+
+def _refine_tca(
+    nodes: np.ndarray,
+    rel_positions: np.ndarray,
+    rel_velocities: np.ndarray,
+    min_index: int,
+) -> float:
+    """
+    Sub-sample refinement of the closest approach inside the bracketing step.
+
+    Uses a cubic Hermite interpolant of the relative state and a bounded
+    minimisation of the squared separation, so the reported TCA is not limited
+    to the coarse sampling grid.
+    """
+    lo = max(0, min_index - 1)
+    hi = min(len(nodes) - 1, min_index + 1)
+    if hi <= lo:
+        return float(nodes[min_index])
+
+    t_lo = float(nodes[lo])
+    t_hi = float(nodes[hi])
+    if t_hi <= t_lo:
+        return float(nodes[min_index])
+
+    def objective(t_value: float) -> float:
+        rel_pos, _ = _hermite_eval(
+            np.array([t_value], dtype=float),
+            nodes,
+            rel_positions,
+            rel_velocities,
+        )
+        return float(np.dot(rel_pos[0], rel_pos[0]))
+
+    try:
+        result = minimize_scalar(
+            objective,
+            bounds=(t_lo, t_hi),
+            method="bounded",
+            options={"xatol": max(1e-9, (t_hi - t_lo) * 1e-10)},
+        )
+    except Exception:
+        return float(nodes[min_index])
+
+    if result.success and t_lo <= float(result.x) <= t_hi:
+        return float(result.x)
+
+    return float(nodes[min_index])
+
+
 def run_to_tca(
     state_a: EciState,
     state_b: EciState,
@@ -121,26 +269,70 @@ def run_to_tca(
     if step_seconds <= 0:
         step_seconds = 1.0
 
-    max_steps = max(1, int(max_steps))
-    if total_seconds == 0.0:
-        t_eval = np.array([0.0])
-    else:
-        steps = max(1, int(np.ceil(total_seconds / step_seconds)))
-        steps = min(steps, max_steps)
-        t_eval = np.linspace(0.0, steps * step_seconds, steps + 1)
+    t_eval = _build_time_grid(total_seconds, step_seconds, max_steps)
 
     positions_a, velocities_a = _rk45_propagate(state_a, t_eval, use_j2=use_j2)
     positions_b, velocities_b = _rk45_propagate(state_b, t_eval, use_j2=use_j2)
 
-    deltas = positions_a - positions_b
-    distances_km = np.linalg.norm(deltas, axis=1)
+    rel_positions = positions_a - positions_b
+    rel_velocities = velocities_a - velocities_b
+    distances_km = np.linalg.norm(rel_positions, axis=1)
     min_index = int(np.argmin(distances_km))
 
-    min_distance_km = float(distances_km[min_index])
-    rel_velocity = velocities_a[min_index] - velocities_b[min_index]
-    rel_velocity_kms = float(np.linalg.norm(rel_velocity))
+    refined_offset = _refine_tca(t_eval, rel_positions, rel_velocities, min_index)
+    refined_pos = None
+    refined_vel = None
+    refined_distance_km = None
+    if refined_offset != float(t_eval[min_index]):
+        refined_pos, refined_vel = _hermite_eval(
+            np.array([refined_offset], dtype=float),
+            t_eval,
+            rel_positions,
+            rel_velocities,
+        )
+        refined_distance_km = float(np.linalg.norm(refined_pos[0]))
 
-    tca_time = start + timedelta(seconds=float(t_eval[min_index]))
+    # Accept the refined point only when it actually improves on the sample.
+    use_refined = (
+        refined_distance_km is not None
+        and refined_distance_km <= float(distances_km[min_index])
+    )
+
+    if use_refined:
+        # The reported states must describe the same instant as the refined
+        # TCA, so re-evaluate each satellite's absolute state at that offset.
+        # At a grid node the interpolant reproduces the integrated state
+        # exactly, so this stays consistent with the sampled trajectories.
+        tca_offset = float(refined_offset)
+        min_distance_km = refined_distance_km
+        rel_velocity_kms = float(np.linalg.norm(refined_vel[0]))
+        refined_a_pos, refined_a_vel = _hermite_eval(
+            np.array([tca_offset], dtype=float),
+            t_eval,
+            positions_a,
+            velocities_a,
+        )
+        refined_b_pos, refined_b_vel = _hermite_eval(
+            np.array([tca_offset], dtype=float),
+            t_eval,
+            positions_b,
+            velocities_b,
+        )
+        position_a_eci = [float(v) for v in refined_a_pos[0]]
+        position_b_eci = [float(v) for v in refined_b_pos[0]]
+        velocity_a_eci = [float(v) for v in refined_a_vel[0]]
+        velocity_b_eci = [float(v) for v in refined_b_vel[0]]
+    else:
+        tca_offset = float(t_eval[min_index])
+        min_distance_km = float(distances_km[min_index])
+        rel_velocity_kms = float(np.linalg.norm(rel_velocities[min_index]))
+        position_a_eci = [float(v) for v in positions_a[min_index]]
+        position_b_eci = [float(v) for v in positions_b[min_index]]
+        velocity_a_eci = [float(v) for v in velocities_a[min_index]]
+        velocity_b_eci = [float(v) for v in velocities_b[min_index]]
+
+    tca_time = start + timedelta(seconds=tca_offset)
+
     tca_utc = tca_time.replace(tzinfo=timezone.utc).isoformat()
 
     trajectory_a = []
@@ -157,10 +349,10 @@ def run_to_tca(
         tca_utc=tca_utc,
         miss_distance_m=round(min_distance_km * 1000.0, 3),
         relative_velocity_kms=round(rel_velocity_kms, 5),
-        position_a_eci=[float(x) for x in positions_a[min_index]],
-        position_b_eci=[float(x) for x in positions_b[min_index]],
-        velocity_a_eci=[float(x) for x in velocities_a[min_index]],
-        velocity_b_eci=[float(x) for x in velocities_b[min_index]],
+        position_a_eci=position_a_eci,
+        position_b_eci=position_b_eci,
+        velocity_a_eci=velocity_a_eci,
+        velocity_b_eci=velocity_b_eci,
         collision_detected=collision_detected,
         trajectory_a=trajectory_a,
         trajectory_b=trajectory_b,

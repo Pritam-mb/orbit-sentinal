@@ -4,16 +4,24 @@ REST API routes for maneuvers, scenarios, and alerts.
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 
 from app.core.state_cache import get_latest_alerts, get_latest_snapshot, set_latest_alerts, set_latest_snapshot, get_all_kalman_states
 from app.core.conjunction import screen_conjunctions
+from app.core.sgp4_propagator import MU, RE
+from app.core.agency import infer_agency
+from app.core.agency_authority import authority_manager
+from app.core import sim_clock
 from app.services.cascade_planner import CascadePlanner
 from app.services.debris_model import build_debris_alerts
-from app.ml.runtime import get_ml_runtime
-from app.ml.model_metrics import get_model_metrics
+from app.services.conjunction_predictor import propagate_states_to, enrich_payload_with_geodetic
+
+# ML modules are imported lazily inside the handlers that need them so that
+# importing the API layer does not pull in torch/xgboost or trigger any model
+# load. See get_ml_runtime_if_enabled() and _get_model_metrics().
 
 try:
     from app.core.satellite_state_tracker import satellite_tracker
@@ -23,6 +31,93 @@ except ImportError:
     _TRACKER_AVAILABLE = False
 
 router = APIRouter(prefix="/api")
+
+
+# ── Agency authority ──────────────────────────────────────────────────────────
+# Commanding is a privileged operation, so every state-changing endpoint is
+# gated on an agency session presented in the X-Agency-Session header.
+#
+# ALLOW_UNAUTHENTICATED_COMMANDS controls what happens when the header is
+# absent. It defaults to 1 so the out-of-the-box demo keeps working, but that
+# is a deployment choice made explicitly here rather than a hardcoded True
+# buried in the authority manager. Set it to 0 in any real deployment and
+# commands without a valid session are rejected with 401.
+
+SESSION_HEADER = "X-Agency-Session"
+DEMO_SESSION = "DEMO_SESSION"
+
+_UNAUTHENTICATED_COMMANDS_DEFAULT = "1"
+
+
+def _unauthenticated_commands_allowed() -> bool:
+    return os.getenv("ALLOW_UNAUTHENTICATED_COMMANDS", _UNAUTHENTICATED_COMMANDS_DEFAULT) == "1"
+
+
+def _session_minting_allowed() -> bool:
+    # Minting a session for an arbitrary agency is a bootstrap operation. It
+    # stays enabled for the demo and must be disabled alongside
+    # ALLOW_UNAUTHENTICATED_COMMANDS in a real deployment.
+    return os.getenv("ALLOW_SESSION_MINTING", _UNAUTHENTICATED_COMMANDS_DEFAULT) == "1"
+
+
+def resolve_session_id(
+    x_agency_session: str | None = Header(default=None, alias=SESSION_HEADER),
+) -> str:
+    """FastAPI dependency: resolve the caller's agency session."""
+    if x_agency_session and x_agency_session.strip():
+        return x_agency_session.strip()
+
+    if _unauthenticated_commands_allowed():
+        return DEMO_SESSION
+
+    raise HTTPException(
+        status_code=401,
+        detail=f"Missing {SESSION_HEADER} header. Commanding requires an agency session.",
+    )
+
+
+def _require_satellite_authority(session_id: str, norad_id: int) -> str:
+    """
+    Enforce that the session may command this satellite.
+
+    Returns the resolved satellite name. Raises 403 when the session is not
+    authorized for the satellite's controlling agency.
+    """
+    satellite_name = f"NORAD-{norad_id}"
+    if _propagator is not None:
+        try:
+            state = _propagator.propagate_one(norad_id)
+            if state is not None and not state.error_code and state.name:
+                satellite_name = state.name
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Could not resolve satellite {norad_id} for authorization: {error}",
+            ) from error
+
+    if not authority_manager.check_authority(session_id, norad_id, satellite_name):
+        session = authority_manager.get_session_info(session_id) or {}
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Session agency '{session.get('agency', 'unknown')}' is not authorized "
+                f"to command '{satellite_name}' (NORAD {norad_id}), which is controlled by "
+                f"'{authority_manager.get_controlling_agency(satellite_name)}'."
+            ),
+        )
+
+    return satellite_name
+
+
+def _require_valid_session(session_id: str) -> None:
+    """Enforce a real, unexpired session for global state changes."""
+    if session_id == DEMO_SESSION:
+        return
+    info = authority_manager.get_session_info(session_id)
+    if info is None:
+        raise HTTPException(status_code=401, detail=f"Unknown agency session '{session_id}'.")
+    if info.get("expired"):
+        raise HTTPException(status_code=401, detail=f"Agency session '{session_id}' has expired.")
 
 
 class ManeuverRequest(BaseModel):
@@ -45,6 +140,30 @@ class JudgeManipulateRequest(BaseModel):
     velocity_eci_kms: list[float] | None = None  # [vx, vy, vz] in km/s
 
 
+class OrbitChangeRequest(BaseModel):
+    norad_id: int
+    target_altitude_km: float
+
+
+class OverrideRequest(BaseModel):
+    """Direct ECI state override (simulation mode only)."""
+    norad_id: int
+    x: float
+    y: float
+    z: float
+    vx: float
+    vy: float
+    vz: float
+
+
+class ManeuverFeedbackRequest(BaseModel):
+    alert_id: str | None = None
+    sat1_id: int
+    sat2_id: int | None = None
+    decision: str
+    delta_v_ms: float = 0.1
+
+
 # These will be set by main.py on startup
 _propagator = None
 _sim_engine = None
@@ -65,6 +184,7 @@ def _build_snapshot(current_propagator, dt: datetime) -> dict:
         {
             "norad_id": state.norad_id,
             "name": state.name,
+            "agency": infer_agency(state.name),
             "position": {
                 "x": state.x,
                 "y": state.y,
@@ -185,7 +305,29 @@ async def get_alerts():
     """Get current conjunction alerts."""
     alerts_snapshot = get_latest_alerts()
     snapshot = get_latest_snapshot()
-    debris_clouds = snapshot.get("debris_clouds", [])
+
+    # Two debris sources exist and both are needed by the client:
+    #   * forecast clouds from build_debris_alerts() -- imminent conjunctions
+    #     above the CPI threshold, carrying the multi-shell `shells` array and
+    #     per-satellite risk bands.
+    #   * fragment clouds from the core EVOLVE model -- clouds that exist only
+    #     because a collision was actually simulated.
+    # The forecast clouds were previously computed and cached but never served:
+    # this handler read the snapshot's fragment clouds only, so the multi-shell
+    # forecast structure never reached the globe.
+    forecast_clouds = alerts_snapshot.get("debris_clouds", []) or []
+    fragment_clouds = snapshot.get("debris_clouds", []) or []
+    debris_clouds = [
+        *(
+            {**cloud, "debris_source": "forecast"}
+            for cloud in forecast_clouds
+        ),
+        *(
+            {**cloud, "debris_source": "fragment"}
+            for cloud in fragment_clouds
+        ),
+    ]
+
     return {
         "alerts": alerts_snapshot.get("alerts", []),
         "count": alerts_snapshot.get("count", 0),
@@ -199,21 +341,33 @@ async def get_alerts():
         "seed_satellites": alerts_snapshot.get("seed_satellites", []),
         "cpi_threshold": alerts_snapshot.get("cpi_threshold", 5.0),
         "node_probabilities": alerts_snapshot.get("node_probabilities", {}),
+        "ranker_review": alerts_snapshot.get("ranker_review", {}),
         "debris_clouds": debris_clouds,
+        "debris_sources": ["forecast", "fragment"],
     }
+
+
+def get_ml_runtime_if_enabled():
+    """Return the ML runtime only when the extended pipeline is enabled."""
+    import os
+    if os.getenv("ENABLE_EXTENDED_PIPELINE", "0") != "1":
+        return None
+    from app.ml.runtime import get_ml_runtime
+    return get_ml_runtime()
 
 
 @router.get("/anomalies")
 async def get_anomalies():
-    runtime = get_ml_runtime()
-    return {
-        "count": len(runtime.get_anomalies()),
-        "anomalies": runtime.get_anomalies(),
-    }
+    runtime = get_ml_runtime_if_enabled()
+    if runtime is None:
+        return {"count": 0, "anomalies": [], "enabled": False}
+    anomalies = runtime.get_anomalies()
+    return {"count": len(anomalies), "anomalies": anomalies, "enabled": True}
 
 
 @router.get("/model-metrics")
 async def get_model_metrics_endpoint():
+    from app.ml.model_metrics import get_model_metrics
     return get_model_metrics()
 
 
@@ -247,7 +401,7 @@ async def get_satellite_orbit(
     span_minutes = max(15, min(span_minutes, 180))
     step_seconds = max(10, min(step_seconds, 300))
 
-    now = datetime.now(timezone.utc)
+    now = sim_clock.simulation_now()
     start = now - timedelta(minutes=span_minutes / 2)
     end = now + timedelta(minutes=span_minutes / 2)
 
@@ -279,10 +433,15 @@ async def get_satellite_orbit(
 
 
 @router.post("/maneuver")
-async def execute_maneuver(req: ManeuverRequest):
+async def execute_maneuver(
+    req: ManeuverRequest,
+    session_id: str = Depends(resolve_session_id),
+):
     """Execute a delta-V maneuver with pre-flight validation."""
     if _sim_engine is None or _propagator is None:
         return {"status": "ERROR", "message": "Sim engine not initialized"}
+
+    _require_satellite_authority(session_id, req.norad_id)
 
     result = _sim_engine.apply_maneuver(
         req.norad_id,
@@ -290,6 +449,7 @@ async def execute_maneuver(req: ManeuverRequest):
         req.dvy,
         req.dvz,
         frame=req.frame,
+        session_id=session_id,
     )
 
     if result.get("status") == "success":
@@ -309,7 +469,7 @@ async def execute_maneuver(req: ManeuverRequest):
         snapshot = await asyncio.to_thread(
             _build_snapshot,
             _propagator,
-            datetime.now(timezone.utc),
+            sim_clock.simulation_now(),
         )
         set_latest_snapshot(snapshot)
 
@@ -325,6 +485,7 @@ async def execute_maneuver(req: ManeuverRequest):
             "seed_satellites": [],
             "cpi_threshold": 5.0,
             "node_probabilities": {},
+            "ranker_review": {},
         }
 
         if sampled_states:
@@ -333,7 +494,7 @@ async def execute_maneuver(req: ManeuverRequest):
                 sampled_states = sampled_states[::step][:250]
 
             kalman_states = get_all_kalman_states()
-            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
+            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=_propagator)
             cascade_summary = await asyncio.to_thread(
                 _cascade_planner.analyze_snapshot,
                 sampled_states,
@@ -362,6 +523,7 @@ async def execute_maneuver(req: ManeuverRequest):
             "seed_satellites": cascade_summary.get("seed_satellites", []),
             "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
             "node_probabilities": cascade_summary.get("node_probabilities", {}),
+            "ranker_review": cascade_summary.get("ranker_review", {}),
             "debris_clouds": debris_clouds,
         }
 
@@ -378,17 +540,215 @@ async def execute_maneuver(req: ManeuverRequest):
             "seed_satellites": result["seed_satellites"],
             "cpi_threshold": result["cpi_threshold"],
             "node_probabilities": result["node_probabilities"],
+            "ranker_review": result.get("ranker_review", {}),
             "debris_clouds": result["debris_clouds"],
         })
 
     return result
 
 
+async def _recompute_alerts_pipeline(propagator) -> dict:
+    """Rebuild snapshot + conjunction/cascade/debris alerts after a state change."""
+    snapshot = await asyncio.to_thread(
+        _build_snapshot,
+        propagator,
+        sim_clock.simulation_now(),
+    )
+    set_latest_snapshot(snapshot)
+
+    sampled_states = snapshot.get("states", [])
+    if len(sampled_states) > 250:
+        step = max(1, len(sampled_states) // 250)
+        sampled_states = sampled_states[::step][:250]
+
+    kalman_states = get_all_kalman_states()
+    alerts = await asyncio.to_thread(
+        screen_conjunctions,
+        sampled_states,
+        kalman_states=kalman_states,
+        propagator=propagator,
+    )
+    cascade_summary = await asyncio.to_thread(
+        _cascade_planner.analyze_snapshot,
+        sampled_states,
+        [alert.to_dict() for alert in alerts],
+        propagator,
+        datetime.fromisoformat(snapshot["timestamp"]),
+    )
+
+    debris_context_states = sampled_states
+    top_hotspot_tca = None
+    for hotspot in cascade_summary.get("hotspots", []):
+        if hotspot.get("tca_utc"):
+            top_hotspot_tca = hotspot["tca_utc"]
+            break
+    if top_hotspot_tca:
+        debris_context_states = await asyncio.to_thread(
+            propagate_states_to,
+            propagator,
+            sampled_states,
+            top_hotspot_tca,
+        )
+
+    debris_clouds = build_debris_alerts(
+        cascade_summary.get("hotspots", []),
+        debris_context_states,
+        snapshot.get("timestamp"),
+        alerts=cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
+        cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
+    )
+
+    serialized_alerts = cascade_summary.get("alerts", [a.to_dict() for a in alerts])
+    hotspots = cascade_summary.get("hotspots", [])
+    enrich_payload_with_geodetic(
+        {"hotspots": hotspots, "debris_clouds": debris_clouds},
+        datetime.fromisoformat(snapshot["timestamp"]),
+    )
+    payload = {
+        "timestamp": snapshot.get("timestamp"),
+        "alerts": serialized_alerts,
+        "count": len(serialized_alerts),
+        "hotspots": cascade_summary.get("hotspots", []),
+        "graph": cascade_summary.get("graph", {}),
+        "cascade_plan": cascade_summary.get("cascade_plan", []),
+        "cascade_depth": cascade_summary.get("cascade_depth", 0),
+        "total_delta_v_ms": cascade_summary.get("total_delta_v_ms", 0.0),
+        "agencies_involved": cascade_summary.get("agencies_involved", []),
+        "seed_satellites": cascade_summary.get("seed_satellites", []),
+        "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
+        "node_probabilities": cascade_summary.get("node_probabilities", {}),
+        "ranker_review": cascade_summary.get("ranker_review", {}),
+        "debris_clouds": debris_clouds,
+    }
+    set_latest_alerts(payload)
+    return payload
+
+
+@router.post("/orbit-change")
+async def orbit_change(
+    req: OrbitChangeRequest,
+    session_id: str = Depends(resolve_session_id),
+):
+    """
+    Execute the first burn of a Hohmann transfer toward a target circular
+    altitude. The second (circularization) burn is computed and returned, to be
+    applied at transfer apogee — this demo applies burn 1 immediately.
+    """
+    if _propagator is None or _sim_engine is None:
+        return {"status": "ERROR", "message": "Sim engine not initialized"}
+
+    _require_satellite_authority(session_id, req.norad_id)
+
+    state = _propagator.propagate_one(req.norad_id)
+    if state is None or state.error_code != 0:
+        return {"status": "ERROR", "message": "Satellite not found"}
+
+    r_norm = float((state.x**2 + state.y**2 + state.z**2) ** 0.5)
+    current_alt_km = r_norm - RE
+    target_alt_km = max(100.0, float(req.target_altitude_km))
+    r2 = RE + target_alt_km
+    a_transfer = (r_norm + r2) / 2.0
+    v_circ_1 = (MU / r_norm) ** 0.5
+    v_transfer_1 = (2.0 * MU / r_norm - MU / a_transfer) ** 0.5
+    v_transfer_2 = (2.0 * MU / r2 - MU / a_transfer) ** 0.5
+    v_circ_2 = (MU / r2) ** 0.5
+    dv1_ms = abs(v_transfer_1 - v_circ_1) * 1000.0
+    dv2_ms = abs(v_circ_2 - v_transfer_2) * 1000.0
+
+    prograde = r2 >= r_norm
+    result = _sim_engine.apply_maneuver(
+        req.norad_id,
+        0.0,
+        dv1_ms if prograde else -dv1_ms,
+        0.0,
+        frame="RSW",
+    )
+
+    payload = None
+    if result.get("status") == "success":
+        payload = await _recompute_alerts_pipeline(_propagator)
+
+    return {
+        **result,
+        "current_altitude_km": round(current_alt_km, 2),
+        "target_altitude_km": round(target_alt_km, 2),
+        "burn_1_ms": round(dv1_ms, 3),
+        "burn_2_ms": round(dv2_ms, 3),
+        "transfer_phase": "BURN_1_APPLIED" if result.get("status") == "success" else "NOT_APPLIED",
+        "alerts": (payload or {}).get("alerts", []),
+        "debris_clouds": (payload or {}).get("debris_clouds", []),
+    }
+
+
+@router.post("/override")
+async def state_override(
+    req: OverrideRequest,
+    session_id: str = Depends(resolve_session_id),
+):
+    """Apply a direct ECI state override (simulation mode only)."""
+    if _propagator is None:
+        return {"status": "ERROR", "message": "Propagator not initialized"}
+
+    _require_satellite_authority(session_id, req.norad_id)
+
+    result = _propagator.apply_state_override(
+        req.norad_id,
+        req.x, req.y, req.z,
+        req.vx, req.vy, req.vz,
+    )
+    if result.get("status") != "success":
+        return result
+
+    payload = await _recompute_alerts_pipeline(_propagator)
+    return {**result, **payload}
+
+
+@router.post("/feedback/maneuver")
+async def maneuver_feedback(
+    req: ManeuverFeedbackRequest,
+    session_id: str = Depends(resolve_session_id),
+):
+    """Record an operator decision and (for approve/modify) apply the maneuver."""
+    if _propagator is None or _sim_engine is None:
+        return {"status": "ERROR", "message": "Not initialized"}
+
+    _require_satellite_authority(session_id, req.sat1_id)
+
+    executed = None
+    if req.decision in ("APPROVE", "MODIFY"):
+        executed = _sim_engine.apply_maneuver(
+            req.sat1_id,
+            0.0,
+            req.delta_v_ms,
+            0.0,
+            frame="RSW",
+            session_id=session_id,
+        )
+
+    payload = None
+    if executed is not None and executed.get("status") == "success":
+        payload = await _recompute_alerts_pipeline(_propagator)
+
+    return {
+        "status": "OK" if executed is None else executed.get("status"),
+        "decision": req.decision,
+        "alert_id": req.alert_id,
+        "sat1_id": req.sat1_id,
+        "executed_maneuver": executed,
+        "alerts": (payload or {}).get("alerts", []),
+    }
+
+
 @router.post("/simulate")
-async def trigger_scenario(req: ScenarioRequest):
+async def trigger_scenario(
+    req: ScenarioRequest,
+    session_id: str = Depends(resolve_session_id),
+):
     """Load a deterministic simulation scenario."""
     if _sim_engine is None:
         return {"status": "ERROR", "message": "Sim engine not initialized"}
+
+    _require_valid_session(session_id)
 
     name = req.name or req.scenario
     if not name:
@@ -402,7 +762,7 @@ async def trigger_scenario(req: ScenarioRequest):
         result = _sim_engine.load_scenario(name)
         # Update snapshot immediately so the new satellites show up on the UI
         if _propagator:
-            snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+            snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
             set_latest_snapshot(snapshot)
         return {"status": "LOADED", **result}
     except FileNotFoundError as e:
@@ -410,18 +770,21 @@ async def trigger_scenario(req: ScenarioRequest):
 
 
 @router.delete("/simulate")
-async def clear_scenario():
+async def clear_scenario(session_id: str = Depends(resolve_session_id)):
     """Clear the active scenario."""
+    _require_valid_session(session_id)
     if _sim_engine:
         _sim_engine.clear_scenario()
     return {"status": "CLEARED"}
 
 
 @router.post("/debris/simulate")
-async def simulate_collision_event():
+async def simulate_collision_event(session_id: str = Depends(resolve_session_id)):
     """Trigger a demo collision event."""
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    _require_valid_session(session_id)
 
     from app.core.debris_model import debris_model
     # Simulate a catastrophic collision in LEO
@@ -437,39 +800,43 @@ async def simulate_collision_event():
         event_id="demo_collision_1"
     )
     
-    snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+    snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
     set_latest_snapshot(snapshot)
     
     return {"status": "SUCCESS", "fragments_generated": len(cloud.fragments)}
 
 
 @router.delete("/debris/active")
-async def clear_debris():
+async def clear_debris(session_id: str = Depends(resolve_session_id)):
     """Clear all active debris clouds."""
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
 
+    _require_valid_session(session_id)
+
     from app.core.debris_model import debris_model
     debris_model.clear()
     
-    snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+    snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
     set_latest_snapshot(snapshot)
     
     return {"status": "CLEARED"}
 
 
 @router.post("/simulation/reset")
-async def reset_simulation():
+async def reset_simulation(session_id: str = Depends(resolve_session_id)):
     """Reset the simulation and clear debris."""
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    _require_valid_session(session_id)
 
     if _sim_engine:
         _sim_engine.clear_scenario()
     from app.core.debris_model import debris_model
     debris_model.clear()
     
-    snapshot = _build_snapshot(_propagator, datetime.now(timezone.utc))
+    snapshot = _build_snapshot(_propagator, sim_clock.simulation_now())
     set_latest_snapshot(snapshot)
     
     return {"status": "RESET"}
@@ -483,6 +850,170 @@ async def list_scenarios():
     return {"scenarios": _sim_engine.list_scenarios()}
 
 
+AGENCY_COLORS = {
+    "SpaceX": "#4a90d9",
+    "NASA": "#1d9e75",
+    "ISS": "#e24b4a",
+    "ESA": "#8f5fd6",
+    "ISRO": "#ef9f27",
+    "Roscosmos": "#c94f4f",
+    "CNSA": "#e24b4a",
+    "NOAA": "#3fa9c9",
+    "Iridium": "#f5c518",
+    "Unknown": "#8a8f98",
+}
+
+
+@router.get("/agencies")
+async def list_agencies():
+    """List the agencies present in the current catalog with satellite counts."""
+    if _propagator is None:
+        return {"agencies": []}
+
+    counts: dict[str, int] = {}
+    try:
+        ids = _propagator.norad_ids
+    except Exception:
+        ids = []
+
+    for norad_id in ids:
+        state = _propagator.propagate_one(norad_id)
+        if state is None:
+            continue
+        agency = infer_agency(state.name)
+        counts[agency] = counts.get(agency, 0) + 1
+
+    agencies = [
+        {
+            "name": name,
+            "count": count,
+            "color": AGENCY_COLORS.get(name, "#8a8f98"),
+        }
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    return {"agencies": agencies, "total": sum(counts.values())}
+
+
+class SimulationTimeRequest(BaseModel):
+    offset_hours: float = 0.0
+
+
+@router.get("/simulation/time")
+async def get_simulation_time():
+    """Get the active simulation time offset."""
+    return {
+        "offset_hours": sim_clock.get_offset_hours(),
+        "simulation_time": sim_clock.simulation_now().isoformat(),
+        "real_time": sim_clock.real_now().isoformat(),
+    }
+
+
+@router.post("/simulation/time")
+async def set_simulation_time(
+    req: SimulationTimeRequest,
+    session_id: str = Depends(resolve_session_id),
+):
+    """
+    Shift the simulation clock and rebuild the snapshot at that epoch.
+
+    The offset is bounded so a typo cannot request an absurd epoch, and it is
+    stored on the shared clock so the background refresh loop keeps honouring
+    it instead of snapping the view back to wall-clock UTC.
+    """
+    _require_valid_session(session_id)
+
+    try:
+        sim_clock.set_offset_hours(req.offset_hours)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    if _propagator is None:
+        raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    sim_time = sim_clock.simulation_now()
+    snapshot = await asyncio.to_thread(_build_snapshot, _propagator, sim_time)
+    set_latest_snapshot(snapshot)
+
+    alerts = 0
+    try:
+        payload = await _recompute_alerts_pipeline(_propagator)
+        alerts = int(payload.get("count", 0) or 0)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Alert recompute failed: {error}") from error
+
+    return {
+        "status": "OK",
+        "offset_hours": sim_clock.get_offset_hours(),
+        "simulation_time": sim_time.isoformat(),
+        "alerts_found": alerts,
+    }
+
+
+class UplinkCommandRequest(BaseModel):
+    type: str
+    delta_v_ms: float | None = None
+    direction: str | None = None
+    altitude_km: float | None = None
+
+
+@router.post("/satellites/{norad_id}/uplink")
+async def satellite_uplink(
+    norad_id: int,
+    req: UplinkCommandRequest,
+    session_id: str = Depends(resolve_session_id),
+):
+    """
+    Accept an uplink command for a satellite.
+
+    MANEUVER and SET_ORBIT are executed through the same validated path as the
+    REST maneuver endpoints; any other command is acknowledged without effect
+    so the link protocol stays explicit.
+    """
+    if _propagator is None or _sim_engine is None:
+        raise HTTPException(status_code=503, detail="Runtime not initialized")
+
+    state = _propagator.propagate_one(norad_id)
+    if state is None or state.error_code != 0:
+        raise HTTPException(status_code=404, detail=f"Satellite {norad_id} not found")
+
+    _require_satellite_authority(session_id, norad_id)
+
+    if req.type == "MANEUVER":
+        delta_v = float(req.delta_v_ms or 0.0)
+        components = {
+            "PROGRADE": (0.0, delta_v, 0.0),
+            "RETROGRADE": (0.0, -delta_v, 0.0),
+            "RADIAL": (delta_v, 0.0, 0.0),
+            "NORMAL": (0.0, 0.0, delta_v),
+        }
+        dvx, dvy, dvz = components.get(req.direction or "PROGRADE", (0.0, delta_v, 0.0))
+        result = _sim_engine.apply_maneuver(
+            norad_id, dvx, dvy, dvz, frame="RSW", session_id=session_id
+        )
+        if result.get("status") == "success":
+            await _recompute_alerts_pipeline(_propagator)
+        return {"result": result}
+
+    if req.type == "SET_ORBIT":
+        return {
+            "result": await orbit_change(
+                OrbitChangeRequest(
+                    norad_id=norad_id,
+                    target_altitude_km=float(req.altitude_km or 550.0),
+                ),
+                session_id=session_id,
+            )
+        }
+
+    return {
+        "result": {
+            "success": True,
+            "message": f"Command '{req.type}' acknowledged (no state change)",
+            "status": "ACK",
+        }
+    }
+
+
 @router.post("/preflight")
 async def preflight_check(req: ManeuverRequest):
     """Run pre-flight validation without executing."""
@@ -494,7 +1025,10 @@ async def preflight_check(req: ManeuverRequest):
 
 
 @router.post("/judge/manipulate-satellite")
-async def judge_manipulate_satellite(req: JudgeManipulateRequest):
+async def judge_manipulate_satellite(
+    req: JudgeManipulateRequest,
+    session_id: str = Depends(resolve_session_id),
+):
     """
     Judge manipulation mode: override a satellite's state and immediately predict
     downstream effects, neighbor risks, and cascade implications.
@@ -502,6 +1036,8 @@ async def judge_manipulate_satellite(req: JudgeManipulateRequest):
     """
     if _propagator is None:
         raise HTTPException(status_code=503, detail="Propagator not initialized")
+
+    _require_satellite_authority(session_id, req.norad_id)
 
     now = datetime.now(timezone.utc)
     
@@ -562,6 +1098,7 @@ async def judge_manipulate_satellite(req: JudgeManipulateRequest):
         "seed_satellites": [],
         "cpi_threshold": 5.0,
         "node_probabilities": {},
+        "ranker_review": {},
     }
     
     sampled_states = []
@@ -573,7 +1110,7 @@ async def judge_manipulate_satellite(req: JudgeManipulateRequest):
             sampled_states = states
         
         kalman_states = get_all_kalman_states()
-        alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
+        alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=_propagator)
         cascade_summary = await asyncio.to_thread(
             _cascade_planner.analyze_snapshot,
             sampled_states,

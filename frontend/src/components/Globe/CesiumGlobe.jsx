@@ -17,7 +17,6 @@ const SATELLITE_SCALE_BY_DISTANCE = new Cesium.NearFarScalar(
   30000000.0,
   0.2,
 );
-const SATELLITE_EXTRAPOLATION_LIMIT_SECONDS = 10.0;
 const ORBIT_BREAK_DISTANCE_KM = 8000;
 const ZERO_VELOCITY = { vx: 0, vy: 0, vz: 0 };
 
@@ -34,7 +33,7 @@ function setBillboardPosition(billboard, cartesian) {
   billboard.position = new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z);
 }
 
-const CesiumGlobe = ({ mode = 'live', alerts = [], showDebris = false, debrisFragments = [], onSatelliteSelect, selectedSatId }) => {
+const CesiumGlobe = ({ mode = 'live', alerts = [], onSatelliteSelect }) => {
   const viewerRef = useRef(null);
   const containerRef = useRef(null);
   const motionRef = useRef({
@@ -683,34 +682,41 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], showDebris = false, debrisFra
         ? cloud.shells
         : [{ label: 'now', radius_km: Number(cloud.radius_km_now ?? cloud.radius_km_at_tca ?? 0) }];
 
-      const debrisRadiusKm = shells.reduce((maxRadius, shell) => {
-        const radiusKm = Number(shell.radius_km ?? 0);
-        return Number.isFinite(radiusKm) && radiusKm > maxRadius ? radiusKm : maxRadius;
-      }, 0);
+      const debrisColor = Cesium.Color.fromCssColorString('#a855f7');
 
-      if (!Number.isFinite(debrisRadiusKm) || debrisRadiusKm <= 0) {
+      // One ellipsoid per temporal shell, so the cloud keeps its layered
+      // structure instead of collapsing into a single envelope sphere.
+      const orderedShells = [...shells]
+        .filter((shell) => Number.isFinite(Number(shell.radius_km)) && Number(shell.radius_km) > 0)
+        .sort((a, b) => Number(a.radius_km) - Number(b.radius_km));
+
+      if (orderedShells.length === 0) {
         continue;
       }
 
-      const debrisColor = Cesium.Color.fromCssColorString('#a855f7');
+      const debrisRadiusKm = Math.max(...orderedShells.map((s) => Number(s.radius_km)));
 
-      // Outer translucent envelope sphere
-      const envelope = viewer.entities.add({
-        position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
-        name: `${cloud.id}-envelope`,
-        ellipsoid: {
-          radii: new Cesium.Cartesian3(
-            debrisRadiusKm * 1000.0,
-            debrisRadiusKm * 1000.0,
-            debrisRadiusKm * 1000.0,
-          ),
-          material: debrisColor.withAlpha(0.22),
-          outline: true,
-          outlineColor: debrisColor.withAlpha(0.9),
-          outlineWidth: 2,
-        },
+      orderedShells.forEach((shell, index) => {
+        const radiusKm = Number(shell.radius_km);
+        // Shells are ordered inner -> outer, so invert the ramp: the outermost
+        // shell is the faintest envelope and the innermost is most opaque.
+        const t = orderedShells.length > 1 ? 1 - index / (orderedShells.length - 1) : 1;
+        const fillAlpha = 0.10 + 0.24 * t;
+        const outlineAlpha = 0.35 + 0.55 * t;
+
+        nextEntities.push(viewer.entities.add({
+          position: new Cesium.Cartesian3(cartesian.x, cartesian.y, cartesian.z),
+          name: `${cloud.id}-shell-${shell.label ?? index}`,
+          description: `${shell.label ?? 'shell'} — r=${radiusKm.toFixed(1)} km`,
+          ellipsoid: {
+            radii: new Cesium.Cartesian3(radiusKm * 1000.0, radiusKm * 1000.0, radiusKm * 1000.0),
+            material: debrisColor.withAlpha(fillAlpha),
+            outline: true,
+            outlineColor: debrisColor.withAlpha(outlineAlpha),
+            outlineWidth: index === orderedShells.length - 1 ? 2 : 1,
+          },
+        }));
       });
-      nextEntities.push(envelope);
 
       // Bright inner hazard core point
       const debrisCore = viewer.entities.add({
@@ -807,7 +813,6 @@ const CesiumGlobe = ({ mode = 'live', alerts = [], showDebris = false, debrisFra
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer || viewer.isDestroyed()) return;
-    const scene = viewer.scene;
 
     const updateMotion = () => {
       // Re-queue immediately to ensure the loop never dies

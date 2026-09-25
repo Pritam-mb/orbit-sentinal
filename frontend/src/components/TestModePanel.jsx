@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import useStore from '../store/useStore';
 import useTestMode from '../hooks/useTestMode';
 
@@ -135,7 +135,6 @@ const TestModePanel = () => {
     setComputed,
     setTestActive,
     setTestSatellites,
-    setSeparation,
   } = useTestMode();
 
   const [searchQuery, setSearchQuery] = useState('');

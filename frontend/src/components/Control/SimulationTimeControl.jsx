@@ -37,10 +37,6 @@ export default function SimulationTimeControl() {
     }
   }
 
-  const resetTime = async () => {
-    await applyTime(0)
-  }
-
   const formattedTime = simTime
     ? new Date(simTime).toUTCString().slice(0, 25)
     : "Loading..."

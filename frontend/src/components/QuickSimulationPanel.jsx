@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import useTestMode from '../hooks/useTestMode';
 
 const QUICK_EPOCH = '2026-05-09T05:40:00Z';

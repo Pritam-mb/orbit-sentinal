@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { useTCACountdown } from '../utils/tcaCountdown';
 import BPlaneDiagram from './BPlaneDiagram';
 import { apiPost } from '../utils/api';
@@ -35,12 +35,18 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
   const [expanded, setExpanded] = useState(false);
   const [showDvEditor, setShowDvEditor] = useState(false);
   const [customDv, setCustomDv] = useState(0.1);
+  const [submitting, setSubmitting] = useState(false);
+  const [decisionError, setDecisionError] = useState(null);
   const addDecisionLogEntry = useStore((s) => s.addDecisionLogEntry);
   const setSelectedAlertId = useStore((s) => s.setSelectedAlertId);
 
   const cpi = Number(alert.cpi_score ?? 0);
   const severity = severityLabel(alert);
-  const tcaHours = Number(alert.tca_hours ?? (Number(alert.tca_minutes ?? 720) / 60));
+  const pc = Number(alert.p_collision ?? alert.probability_of_collision ?? 0);
+  const tcaFromUtc = alert.tca_utc ? (new Date(alert.tca_utc).getTime() - Date.now()) / 3_600_000 : NaN;
+  const tcaHours = Number.isFinite(tcaFromUtc)
+    ? tcaFromUtc
+    : Number(alert.tca_hours ?? (Number(alert.tca_minutes ?? NaN) / 60));
   const { formatted, urgent, critical } = useTCACountdown(tcaHours);
 
   const sat1 = alert.sat1 ?? {};
@@ -71,15 +77,26 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
       decision,
       delta_v_ms: dv ?? deltaV,
     };
+
+    setSubmitting(true);
+    setDecisionError(null);
     try {
       await apiPost('/api/feedback/maneuver', payload);
-    } catch (_) { /* silent */ }
+    } catch (e) {
+      // The decision was not recorded: surface the failure and keep the editor
+      // open so the operator can retry or change course.
+      setDecisionError(e?.message || 'Failed to submit decision');
+      setSubmitting(false);
+      return;
+    }
+
     addDecisionLogEntry({
       time: new Date().toISOString(),
       decision,
       alert_id: alert.id,
       sat: sat1.name ?? 'unknown',
     });
+    setSubmitting(false);
     onDecision?.(decision, alert);
     setShowDvEditor(false);
   };
@@ -112,7 +129,7 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
       {/* Metrics row */}
       <div className="threat-metrics-row">
         <span className="threat-metric">Miss: <strong>{missKm.toFixed(1)}km</strong></span>
-        <span className="threat-metric">Pc: <strong>{formatPc(alert.p_collision)}</strong></span>
+        <span className="threat-metric">Pc: <strong>{formatPc(pc)}</strong></span>
         <span className="threat-metric">TCA: <strong>{tcaHours.toFixed(1)}h</strong></span>
         <span className="threat-metric">Casc: <strong>{cascadeCount}</strong></span>
       </div>
@@ -236,11 +253,16 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
               <button
                 type="button"
                 className="td-btn modify"
+                disabled={submitting}
                 onClick={() => handleDecision('MODIFY', customDv)}
               >
-                Execute Modified Maneuver
+                {submitting ? 'Submitting...' : 'Execute Modified Maneuver'}
               </button>
             </div>
+          )}
+
+          {decisionError && (
+            <div className="error-banner">{decisionError}</div>
           )}
 
           {/* Decision buttons */}
@@ -248,6 +270,7 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
             <button
               type="button"
               className="td-btn approve"
+              disabled={submitting}
               onClick={() => handleDecision('APPROVE')}
             >
               Approve
@@ -255,6 +278,7 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
             <button
               type="button"
               className="td-btn modify"
+              disabled={submitting}
               onClick={() => setShowDvEditor((v) => !v)}
             >
               Modify
@@ -262,6 +286,7 @@ export default function ThreatCard({ alert, isSelected, onDecision }) {
             <button
               type="button"
               className="td-btn reject"
+              disabled={submitting}
               onClick={() => handleDecision('REJECT')}
             >
               Reject

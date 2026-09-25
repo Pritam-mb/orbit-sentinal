@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import useStore from '../store/useStore';
 import { apiGet } from '../utils/api';
 
@@ -72,10 +72,10 @@ export default function TelemetryStrip({ selectedSatId }) {
     : '—';
 
   // Telemetry from API or defaults
-  const fuel = telemetry?.fuel_pct ?? 85;
+  const fuel = telemetry?.fuel_remaining_pct ?? 85;
   const bat = telemetry?.battery_pct ?? 92;
-  const temp = telemetry?.temp_c ?? 22;
-  const sig = telemetry?.signal_dbm ?? -85;
+  const temp = telemetry?.temperature_c ?? 22;
+  const sig = telemetry?.signal_strength_dbm ?? -85;
 
   // Risk from alerts
   const satAlerts = alerts.filter(

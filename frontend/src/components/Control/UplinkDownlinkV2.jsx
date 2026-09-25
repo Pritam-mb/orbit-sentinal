@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import useStore from '../../store/useStore';
 import { apiPost } from '../../utils/api';
 
@@ -28,6 +28,15 @@ function hohmannDv(altCurrentKm, altTargetKm) {
   return { dv1: (dv1).toFixed(2), dv2: (dv2).toFixed(2), transferMin };
 }
 
+function directionToRsw(direction, dvMs) {
+  switch (direction) {
+    case 'RADIAL': return { dvx: dvMs, dvy: 0, dvz: 0 };
+    case 'NORMAL': return { dvx: 0, dvy: 0, dvz: dvMs };
+    case 'RETROGRADE': return { dvx: 0, dvy: -dvMs, dvz: 0 };
+    default: return { dvx: 0, dvy: dvMs, dvz: 0 }; // PROGRADE
+  }
+}
+
 export default function UplinkDownlinkV2({ selectedSatId }) {
   const satellites = useStore((s) => s.satellites);
   const addDecisionLogEntry = useStore((s) => s.addDecisionLogEntry);
@@ -44,7 +53,37 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
   const [override, setOverride] = useState({ x: '', y: '', z: '', vx: '', vy: '', vz: '' });
   const [cmdLog, setCmdLog] = useState([]);
   const [downlinkHistory, setDownlinkHistory] = useState([]);
+  const [fuelPct, setFuelPct] = useState(null);
+  const [maneuverPreview, setManeuverPreview] = useState(null);
+  const [previewError, setPreviewError] = useState(null);
   const downlinkTimer = useRef(null);
+
+  // Fuel comes from the backend telemetry tracker, not a hardcoded constant.
+  useEffect(() => {
+    if (!sat) {
+      setFuelPct(null);
+      return;
+    }
+    let cancelled = false;
+    const loadFuel = async () => {
+      try {
+        const res = await fetch(`/api/satellites/${sat.norad_id}/telemetry`);
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        const value = Number(data?.fuel_remaining_pct);
+        setFuelPct(Number.isFinite(value) ? value : null);
+      } catch (_) {
+        if (!cancelled) setFuelPct(null);
+      }
+    };
+    loadFuel();
+    const timer = setInterval(loadFuel, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [sat]);
 
   // Build downlink history from sat data
   useEffect(() => {
@@ -58,12 +97,18 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
         ? Math.max(...satAlerts.map((a) => Number(a.cpi_score ?? 0)))
         : 0;
       setDownlinkHistory((prev) => [
-        { ts, alt: sat.altitude_km?.toFixed(0) ?? '—', spd: (sat.speed_kmh ? (sat.speed_kmh / 3600).toFixed(2) : '—'), fuel: 85, cpi: cpi.toFixed(1) },
+        {
+          ts,
+          alt: sat.altitude_km?.toFixed(0) ?? '—',
+          spd: (sat.speed_kmh ? (sat.speed_kmh / 3600).toFixed(2) : '—'),
+          fuel: fuelPct != null ? fuelPct.toFixed(1) : '—',
+          cpi: cpi.toFixed(1),
+        },
         ...prev,
       ].slice(0, 5));
     }, 2000);
     return () => clearInterval(downlinkTimer.current);
-  }, [sat, alerts]);
+  }, [sat, alerts, fuelPct]);
 
   // Nearest threat for maneuver preview
   const nearestAlert = sat
@@ -73,9 +118,50 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
     : null;
 
   const currentMiss = nearestAlert ? Number(nearestAlert.miss_distance_km ?? 0) : null;
-  const predictedMiss = currentMiss != null ? (currentMiss + dvAmount * 20).toFixed(2) : null;
   const altKm = sat?.altitude_km ?? 400;
   const { dv1, dv2, transferMin } = hohmannDv(altKm, targetAlt);
+
+  // Post-burn miss distance is requested from the backend, which actually
+  // propagates the burn. It is never synthesised on the client.
+  useEffect(() => {
+    if (!sat || currentMiss == null) {
+      setManeuverPreview(null);
+      setPreviewError(null);
+      return;
+    }
+    let cancelled = false;
+    const dv = directionToRsw(direction, dvAmount);
+    const run = async () => {
+      try {
+        const res = await fetch('/api/preflight', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            norad_id: sat.norad_id,
+            dvx: dv.dvx,
+            dvy: dv.dvy,
+            dvz: dv.dvz,
+            frame: 'RSW',
+          }),
+        });
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        setManeuverPreview(data);
+        setPreviewError(null);
+      } catch (e) {
+        if (cancelled) return;
+        setManeuverPreview(null);
+        setPreviewError(e?.message || 'preview unavailable');
+      }
+    };
+
+    const timer = setTimeout(run, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [sat, currentMiss, direction, dvAmount]);
 
   const logCmd = (type, result, ok = true) => {
     const ts = new Date().toISOString().substring(11, 19);
@@ -86,10 +172,13 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
   const handleManeuver = async () => {
     if (!sat) return;
     try {
+      const dv = directionToRsw(direction, dvAmount);
       await apiPost('/api/maneuver', {
         norad_id: sat.norad_id,
-        delta_v_ms: dvAmount,
-        direction,
+        dvx: dv.dvx,
+        dvy: dv.dvy,
+        dvz: dv.dvz,
+        frame: 'RSW',
       });
       logCmd('MANEUVER', `${direction} ${dvAmount}m/s OK`, true);
     } catch (e) {
@@ -110,11 +199,27 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
     }
   };
 
+  const overrideKeys = ['x', 'y', 'z', 'vx', 'vy', 'vz'];
+  const overrideComplete = overrideKeys.every((f) => {
+    const raw = override[f];
+    if (raw === '' || raw === null || raw === undefined) return false;
+    return Number.isFinite(Number(raw));
+  });
+
   const handleOverride = async () => {
     if (!sat) return;
+    if (!overrideComplete) {
+      logCmd('OVERRIDE', 'All six ECI components must be numeric', false);
+      return;
+    }
     try {
-      await apiPost('/api/override', { norad_id: sat.norad_id, ...override });
+      // Pydantic requires floats; sending the raw strings yields a 422.
+      const numeric = Object.fromEntries(
+        overrideKeys.map((f) => [f, Number(override[f])])
+      );
+      await apiPost('/api/override', { norad_id: sat.norad_id, ...numeric });
       logCmd('OVERRIDE', 'State applied', true);
+      setOverride({ x: '', y: '', z: '', vx: '', vy: '', vz: '' });
     } catch (e) {
       logCmd('OVERRIDE', e.message, false);
     }
@@ -221,10 +326,35 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
                     <span className="udv2-preview-label">Current miss</span>
                     <span className="udv2-preview-value">{currentMiss.toFixed(2)} km</span>
                   </div>
-                  <div className="udv2-preview-row">
-                    <span className="udv2-preview-label">After maneuver</span>
-                    <span className="udv2-preview-value better">{predictedMiss} km</span>
-                  </div>
+                  {previewError ? (
+                    <div className="udv2-preview-row">
+                      <span className="udv2-preview-label">After maneuver</span>
+                      <span className="udv2-preview-value" style={{ color: 'var(--alert-red)' }}>
+                        unavailable
+                      </span>
+                    </div>
+                  ) : (
+                    maneuverPreview?.trajectory && (
+                      <>
+                        <div className="udv2-preview-row">
+                          <span className="udv2-preview-label">After maneuver</span>
+                          <span className="udv2-preview-value better">
+                            {maneuverPreview.trajectory.min_miss_distance_km != null
+                              ? `${Number(maneuverPreview.trajectory.min_miss_distance_km).toFixed(2)} km`
+                              : '—'}
+                          </span>
+                        </div>
+                        <div className="udv2-preview-row">
+                          <span className="udv2-preview-label">Closest TCA</span>
+                          <span className="udv2-preview-value">
+                            {maneuverPreview.trajectory.closest_tca_minutes != null
+                              ? `${Number(maneuverPreview.trajectory.closest_tca_minutes).toFixed(1)} min`
+                              : '—'}
+                          </span>
+                        </div>
+                      </>
+                    )
+                  )}
                   <div className="udv2-preview-row">
                     <span className="udv2-preview-label">Fuel cost</span>
                     <span className="udv2-preview-value">{(dvAmount * 0.3).toFixed(2)}%</span>
@@ -297,6 +427,8 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
                 {['x', 'y', 'z'].map((f) => (
                   <input
                     key={f}
+                    type="number"
+                    step="any"
                     placeholder={`Position ${f.toUpperCase()} (km)`}
                     value={override[f]}
                     onChange={(e) => setOverride((o) => ({ ...o, [f]: e.target.value }))}
@@ -305,6 +437,8 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
                 {['vx', 'vy', 'vz'].map((f) => (
                   <input
                     key={f}
+                    type="number"
+                    step="any"
                     placeholder={`Velocity ${f.toUpperCase()} (km/s)`}
                     value={override[f]}
                     onChange={(e) => setOverride((o) => ({ ...o, [f]: e.target.value }))}
@@ -314,7 +448,7 @@ export default function UplinkDownlinkV2({ selectedSatId }) {
               <button
                 type="button"
                 className="udv2-execute-btn"
-                disabled={!sat}
+                disabled={!sat || !overrideComplete}
                 onClick={handleOverride}
               >
                 Apply Override

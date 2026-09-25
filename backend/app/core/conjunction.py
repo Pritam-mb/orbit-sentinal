@@ -62,6 +62,7 @@ class ConjunctionEvent:
         "miss_distance_km",
         "relative_speed_kmh",
         "tca_utc",
+        "tca_hours",
         "severity",
         "probability_of_collision",
         "cpi_score",
@@ -76,6 +77,7 @@ class ConjunctionEvent:
         self.miss_distance_km = 0.0
         self.relative_speed_kmh = 0.0
         self.tca_utc = ""
+        self.tca_hours = 0.0
         self.severity = "green"
         self.probability_of_collision = 0.0
         self.cpi_score = 0.0
@@ -83,13 +85,17 @@ class ConjunctionEvent:
 
     def to_dict(self) -> dict:
         return {
+            "id": f"{self.sat1_id}-{self.sat2_id}",
             "sat1": {"id": self.sat1_id, "name": self.sat1_name},
             "sat2": {"id": self.sat2_id, "name": self.sat2_name},
             "miss_distance_km": round(self.miss_distance_km, 3),
             "relative_speed_kmh": round(self.relative_speed_kmh, 2),
             "tca_utc": self.tca_utc,
+            "tca_hours": round(self.tca_hours, 3),
+            "tca_minutes": round(self.tca_hours * 60.0, 2),
             "severity": self.severity,
             "probability_of_collision": round(self.probability_of_collision, 8),
+            "p_collision": round(self.probability_of_collision, 8),
             "cpi_score": round(self.cpi_score, 2),
             "covariance_ellipse": self.covariance_ellipse,
         }
@@ -299,12 +305,18 @@ def screen_conjunctions(
     states: list[SatelliteState],
     threshold_km: float = WATCH_DISTANCE_KM,
     kalman_states: dict = None,
+    propagator: SGP4Propagator = None,
 ) -> list[ConjunctionEvent]:
     """
     Pairwise conjunction screening with Foster B-plane collision probability.
 
     Uses analytics.compute_collision_probability (Foster 1992) as primary path.
     Falls back to Gaussian approximation only if analytics import failed.
+
+    When a propagator is supplied, real Time-of-Closest-Approach is refined
+    via find_tca() for red/yellow pairs (distance <= WARNING_DISTANCE_KM),
+    so tca_utc reflects the actual closest approach rather than the snapshot
+    epoch and CPI uses the true time-to-closest-approach.
 
     kalman_states: dict[norad_id] -> dict with covariance_6x6 (optional, legacy)
     Returns events where miss distance < threshold or CPI > 2.0, sorted by CPI.
@@ -390,8 +402,42 @@ def screen_conjunctions(
                 except Exception as ric_err:
                     logger.debug("RIC CPI computation failed: %s", ric_err)
 
+            # ── Real TCA refinement for close pairs (red/yellow) ────────────
+            tca_utc = s1.epoch_utc
+            if propagator is not None and severity in ("red", "yellow"):
+                try:
+                    refined = find_tca(
+                        propagator,
+                        s1.norad_id,
+                        s2.norad_id,
+                        hours_ahead=24.0,
+                        steps=240,
+                    )
+                    if refined is not None and refined.miss_distance_km <= dist:
+                        dist = refined.miss_distance_km
+                        rel_speed_kmh = refined.relative_speed_kmh
+                        rel_speed_kms = rel_speed_kmh / 3600.0
+                        tca_utc = refined.tca_utc
+                except Exception as tca_err:
+                    logger.debug("TCA refinement failed for (%d, %d): %s", s1.norad_id, s2.norad_id, tca_err)
+
             # ── CPI with Foster-calibrated weights ─────────────────────────
-            tca_hours = 12.0  # Default; refined when TCA search is available
+            # TCA urgency is measured against the snapshot epoch, not wall
+            # clock. Using datetime.now() made the value drift whenever the
+            # simulation clock is warped, and desynchronised CPI from the
+            # states actually being screened.
+            tca_hours = 12.0  # Used when TCA is unavailable
+            try:
+                tca_dt = datetime.fromisoformat(tca_utc)
+                if tca_dt.tzinfo is None:
+                    tca_dt = tca_dt.replace(tzinfo=timezone.utc)
+                reference = datetime.fromisoformat(s1.epoch_utc)
+                if reference.tzinfo is None:
+                    reference = reference.replace(tzinfo=timezone.utc)
+                tca_hours = max(0.0, (tca_dt - reference).total_seconds() / 3600.0)
+            except Exception:
+                pass
+
             cpi_score = compute_cpi_score(
                 p_collision,
                 dist,
@@ -411,7 +457,8 @@ def screen_conjunctions(
             event.sat2_name = s2.name
             event.miss_distance_km = dist
             event.relative_speed_kmh = rel_speed_kmh
-            event.tca_utc = s1.epoch_utc
+            event.tca_utc = tca_utc
+            event.tca_hours = tca_hours
             event.severity = severity
             event.probability_of_collision = p_collision
             event.cpi_score = cpi_score

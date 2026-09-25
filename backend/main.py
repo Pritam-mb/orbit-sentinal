@@ -8,12 +8,14 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from app.core.sgp4_propagator import SGP4Propagator
+from app.core.agency import infer_agency
+from app.core import sim_clock
 from app.core.conjunction import screen_conjunctions
 from app.core.state_cache import (
     get_latest_snapshot,
@@ -25,9 +27,11 @@ from app.data.tle_fetcher import fetch_tles
 from app.simulation.sim_engine import SimEngine
 from app.services.cascade_planner import CascadePlanner
 from app.services.debris_model import build_debris_alerts
+from app.services.conjunction_predictor import propagate_states_to, enrich_payload_with_geodetic
 from app.api.ws_handler import ConnectionManager, satellite_broadcast_loop
 from app.api.routes import router, init_routes
 from app.routers.test_mode import router as test_mode_router, init_test_mode
+from app.routers.predict import router as predict_router, init_predict_router
 from app.ml.runtime import get_ml_runtime
 from app.streaming.kafka_adapter import KafkaAdapter
 
@@ -41,12 +45,15 @@ propagator = SGP4Propagator()
 sim_engine = SimEngine(propagator)
 ws_manager = ConnectionManager()
 cascade_planner = CascadePlanner()
-ml_runtime = get_ml_runtime()
 USE_APSCHEDULER = os.getenv("USE_APSCHEDULER", "0") == "1"
 SNAPSHOT_REFRESH_SECONDS = float(os.getenv("SNAPSHOT_REFRESH_SECONDS", "1"))
 ALERT_REFRESH_SECONDS = float(os.getenv("ALERT_REFRESH_SECONDS", "30"))
 ENABLE_EXTENDED_PIPELINE = os.getenv("ENABLE_EXTENDED_PIPELINE", "0") == "1"
 
+# Only construct the ML runtime when the extended pipeline is enabled.
+# get_ml_runtime() is an lru_cache singleton: calling it eagerly would load or
+# train models, create the shadow database, and write artifacts on every
+# startup even when the feature is disabled.
 ml_runtime = get_ml_runtime() if ENABLE_EXTENDED_PIPELINE else None
 kafka_adapter = KafkaAdapter() if ENABLE_EXTENDED_PIPELINE else None
 
@@ -62,6 +69,7 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
         {
             "norad_id": state.norad_id,
             "name": state.name,
+            "agency": infer_agency(state.name),
             "position": {
                 "x": state.x,
                 "y": state.y,
@@ -112,7 +120,7 @@ def build_snapshot(current_propagator: SGP4Propagator, dt: datetime) -> dict:
 
 async def refresh_snapshot_once():
     try:
-        now = datetime.now(timezone.utc)
+        now = sim_clock.simulation_now()
 
         # Propagate debris fragments in the core model
         from app.core.debris_model import debris_model
@@ -140,11 +148,96 @@ async def refresh_snapshot_loop():
         await asyncio.sleep(SNAPSHOT_REFRESH_SECONDS)
 
 
-async def refresh_alerts_once():
-    """Refresh conjunction alerts at a slower cadence to avoid blocking startup."""
-    if not ENABLE_EXTENDED_PIPELINE:
-        return
+def _alert_pair_key(alert: dict) -> tuple:
+    sat1 = (alert.get("sat1") or {}).get("id")
+    sat2 = (alert.get("sat2") or {}).get("id")
+    if sat1 is None or sat2 is None:
+        return ()
+    return (sat1, sat2) if sat1 <= sat2 else (sat2, sat1)
 
+
+def _normalize_screened_alert(alert: dict) -> dict:
+    """Project a screened ConjunctionAlert onto the richer graph-edge shape.
+
+    The cascade planner emits graph alerts that carry predicted TCA, CPI,
+    p_collision, hotspot score and a hotspot position. Screened alerts carry the
+    measured miss distance, real collision probability, TCA and severity but no
+    hotspot geometry. The frontend reads the graph shape (with fallbacks), so
+    screened alerts are projected onto it before being emitted.
+    """
+    tca_utc = alert.get("tca_utc")
+    tca_hours = alert.get("tca_hours")
+    if tca_hours is None:
+        tca_hours = 12.0
+    tca_hours = float(tca_hours)
+    tca_minutes = alert.get("tca_minutes")
+    if tca_minutes is None:
+        tca_minutes = tca_hours * 60.0
+    tca_minutes = float(tca_minutes)
+    p_collision = alert.get("probability_of_collision", 0.0)
+
+    return {
+        "id": alert.get("id"),
+        "sat1": alert.get("sat1", {}),
+        "sat2": alert.get("sat2", {}),
+        "miss_distance_km": alert.get("miss_distance_km"),
+        "relative_speed_kmh": alert.get("relative_speed_kmh"),
+        "tca_utc": tca_utc,
+        "tca_hours": round(tca_hours, 3),
+        "tca_minutes": round(tca_minutes, 2),
+        "severity": alert.get("severity", "none"),
+        "cpi_score": alert.get("cpi_score", 0.0),
+        "p_collision": p_collision,
+        "probability_of_collision": p_collision,
+        "hotspot_score": 0.0,
+        "influence_weight": 0.0,
+        "position": None,
+        "zone_radius_km": 100.0,
+        "covariance_ellipse": alert.get("covariance_ellipse"),
+        "source": "screening",
+    }
+
+
+def merge_alert_sources(
+    graph_alerts: list[dict] | None,
+    screened_alerts: list[dict] | None,
+) -> list[dict]:
+    """Combine graph-edge alerts and screened alerts into one consistent list.
+
+    Screening uses the wider WATCH_DISTANCE_KM (500 km) while the cascade graph
+    only keeps pairs inside DEFAULT_INFLUENCE_RADIUS_KM (200 km). Returning only
+    the graph list therefore hid every conjunction between 200 km and 500 km,
+    and the response reported a `count` derived from screening next to a list
+    derived from the graph. The two sources are now unioned, graph entries win
+    on duplicate pairs, and the caller can derive `count` from the result.
+    """
+    merged: list[dict] = []
+    seen: set[tuple] = set()
+
+    for alert in graph_alerts or []:
+        key = _alert_pair_key(alert)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append({**alert, "source": alert.get("source", "cascade_graph")})
+
+    for alert in screened_alerts or []:
+        key = _alert_pair_key(alert)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(_normalize_screened_alert(alert))
+
+    return merged
+
+
+async def refresh_alerts_once():
+    """Refresh conjunction alerts at a slower cadence to avoid blocking startup.
+
+    ENABLE_EXTENDED_PIPELINE gates only the optional heavy ML runtime and the
+    Kafka publisher. Conjunction screening, cascade planning, hotspot generation
+    and debris building are core product behaviour and always run.
+    """
     max_alert_states = 250
     try:
         snapshot = get_latest_snapshot()
@@ -171,7 +264,7 @@ async def refresh_alerts_once():
                 sampled_states = states
 
             kalman_states = get_all_kalman_states()
-            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states)
+            alerts = await asyncio.to_thread(screen_conjunctions, sampled_states, kalman_states=kalman_states, propagator=propagator)
             cascade_summary = await asyncio.to_thread(
                 cascade_planner.analyze_snapshot,
                 sampled_states,
@@ -180,20 +273,46 @@ async def refresh_alerts_once():
                 snapshot.get("timestamp") and datetime.fromisoformat(snapshot["timestamp"]),
             )
 
+            debris_context_states = sampled_states
+            top_hotspot_tca = None
+            for hotspot in cascade_summary.get("hotspots", []):
+                if hotspot.get("tca_utc"):
+                    top_hotspot_tca = hotspot["tca_utc"]
+                    break
+            if top_hotspot_tca:
+                debris_context_states = await asyncio.to_thread(
+                    propagate_states_to,
+                    propagator,
+                    sampled_states,
+                    top_hotspot_tca,
+                )
+
+            merged_alerts = merge_alert_sources(
+                cascade_summary.get("alerts", []),
+                [a.to_dict() for a in alerts],
+            )
+
             debris_clouds = build_debris_alerts(
                 cascade_summary.get("hotspots", []),
-                sampled_states if states else [],
+                debris_context_states if states else [],
                 snapshot.get("timestamp"),
-                alerts=cascade_summary.get("alerts", []),
+                alerts=merged_alerts,
                 cpi_threshold=cascade_summary.get("cpi_threshold", 5.0),
+            )
+            hotspots = cascade_summary.get("hotspots", [])
+            enrich_payload_with_geodetic(
+                {"hotspots": hotspots, "debris_clouds": debris_clouds},
+                datetime.fromisoformat(snapshot["timestamp"]),
             )
 
             alerts_payload = {
                 "type": "alerts",
                 "timestamp": snapshot.get("timestamp"),
-                "alerts": cascade_summary.get("alerts", [a.to_dict() for a in alerts]),
-                "count": len(alerts),
-                "hotspots": cascade_summary.get("hotspots", []),
+                "alerts": merged_alerts,
+                "count": len(merged_alerts),
+                "screened_count": len(alerts),
+                "graph_alert_count": len(cascade_summary.get("alerts", [])),
+                "hotspots": hotspots,
                 "graph": cascade_summary.get("graph", {}),
                 "cascade_plan": cascade_summary.get("cascade_plan", []),
                 "cascade_depth": cascade_summary.get("cascade_depth", 0),
@@ -202,6 +321,7 @@ async def refresh_alerts_once():
                 "seed_satellites": cascade_summary.get("seed_satellites", []),
                 "cpi_threshold": cascade_summary.get("cpi_threshold", 5.0),
                 "node_probabilities": cascade_summary.get("node_probabilities", {}),
+                "ranker_review": cascade_summary.get("ranker_review", {}),
                 "debris_clouds": debris_clouds,
             }
             set_latest_alerts(alerts_payload)
@@ -258,16 +378,21 @@ async def lifespan(app: FastAPI):
     except Exception as _auth_err:
         print(f"  WARNING: agency_authority failed: {_auth_err}")
 
-    print("Initializing XGBoost risk classifier (may train on first run — ~1-3 min)...")
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: __import__("app.ml.xgboost_scorer", fromlist=["_trained_model"]),
-        )
-        print("  XGBoost risk classifier ready")
-    except Exception as _xgb_err:
-        print(f"  WARNING: XGBoost init failed: {_xgb_err}")
+    if ENABLE_EXTENDED_PIPELINE:
+        print("Initializing XGBoost risk classifier (loads on first use)...")
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: __import__("app.ml.xgboost_scorer", fromlist=["_trained_model"]),
+            )
+            print("  XGBoost risk classifier ready")
+        except Exception as _xgb_err:
+            print(f"  WARNING: XGBoost init failed: {_xgb_err}")
+    else:
+        # Flag is off: the trained model is never touched at startup, and
+        # scoring uses the cheap boosted-stump heuristic.
+        print("  XGBoost risk classifier deferred (ENABLE_EXTENDED_PIPELINE=0)")
 
     print("=== Model initialization complete ===")
 
@@ -277,13 +402,14 @@ async def lifespan(app: FastAPI):
     propagator.load_tles(tles)
     logger.info(f"Tracking {propagator.satellite_count} satellites from current TLE source")
 
-    now = datetime.now(timezone.utc)
+    now = sim_clock.simulation_now()
     set_latest_snapshot(await asyncio.to_thread(build_snapshot, propagator, now))
     set_latest_alerts({"timestamp": now.isoformat(), "alerts": [], "count": 0, "hotspots": [], "debris_clouds": []})
 
     # Initialize REST routes with shared instances
     init_routes(propagator, sim_engine)
     init_test_mode(propagator)
+    init_predict_router(propagator)
 
     scheduler = None
     snapshot_task = None
@@ -331,7 +457,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -339,6 +465,7 @@ app.add_middleware(
 # Mount REST routes
 app.include_router(router)
 app.include_router(test_mode_router)
+app.include_router(predict_router)
 
 
 @app.get("/")
@@ -352,15 +479,23 @@ async def root():
 
 @app.websocket("/ws/satellites")
 async def websocket_satellites(websocket: WebSocket):
-    """WebSocket endpoint for real-time satellite position updates."""
+    """WebSocket endpoint for real-time satellite position updates.
+
+    The server pushes snapshots from `satellite_broadcast_loop`; this handler
+    only drains inbound frames (currently the client's `ping` heartbeat) so the
+    connection stays healthy. Frames are logged at debug level rather than
+    assigned to an unused local.
+    """
     await ws_manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive, listen for client messages
-            data = await websocket.receive_text()
-            # Client can send commands here if needed
+            frame = await websocket.receive_text()
+            logger.debug("WebSocket frame from client: %s", frame)
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
+    except Exception:
+        ws_manager.disconnect(websocket)
+        raise
 
 
 if __name__ == "__main__":

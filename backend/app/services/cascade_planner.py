@@ -22,27 +22,24 @@ from scipy.optimize import minimize
 from app.core.conjunction import classify_severity, find_tca
 from app.core.sgp4_propagator import SatelliteState, rsw_to_eci
 from app.ml.gat_cascade import CascadeGAT
+from app.ml.gnn_cascade import CascadeGNN
 from app.ml.xgboost_scorer import XGBoostScorer
+from app.core.agency import AGENCY_ALIASES as agency_aliases, infer_agency as agency_inference
 
 logger = logging.getLogger(__name__)
 
 R_EARTH_KM = 6371.0
 DEFAULT_INFLUENCE_RADIUS_KM = 200.0
 DEFAULT_CPI_THRESHOLD = 5.0
+# Probability gap above which the GAT and the GNN cross-check are considered to
+# disagree about a satellite. Tuned to sit above ordinary disagreement on the
+# synthetic graphs while still catching a ranker that is structurally wrong
+# rather than merely noisy.
+RANKER_DISAGREEMENT_THRESHOLD = 0.25
 
 
-AGENCY_ALIASES = [
-    ("STARLINK", "SpaceX"),
-    ("SPACEX", "SpaceX"),
-    ("ISS", "ISS"),
-    ("COSMOS", "Roscosmos"),
-    ("RESURS", "Roscosmos"),
-    ("FENGYUN", "CNSA"),
-    ("YAOGAN", "CNSA"),
-    ("NOAA", "NOAA"),
-    ("HUBBLE", "NASA"),
-    ("IRIDIUM", "Iridium"),
-]
+AGENCY_ALIASES = agency_aliases
+infer_agency = agency_inference
 
 
 @dataclass
@@ -54,14 +51,6 @@ class CascadeNode:
     speed_kmh: float
     altitude_km: float
     agency: str
-
-
-def infer_agency(name: str) -> str:
-    upper_name = (name or "").upper()
-    for keyword, agency in AGENCY_ALIASES:
-        if keyword in upper_name:
-            return agency
-    return "Unknown"
 
 
 def _norm(vec: np.ndarray) -> float:
@@ -125,9 +114,17 @@ def _build_node(state: SatelliteState) -> CascadeNode:
 class CascadePlanner:
     """KD-tree based proximity graph planner with cascade scoring."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.risk_model = XGBoostScorer()
-        self.gnn = CascadeGAT()
+        # The primary ranker was historically stored on an attribute called
+        # `self.gnn` while actually holding a CascadeGAT, which hid the fact
+        # that CascadeGNN was never in the request path. It is now named for
+        # what it is, and the GNN is kept as a deliberate cross-check.
+        self.primary_ranker = CascadeGAT()
+        # Second, structurally different ranker. It does not contribute to the
+        # manoeuvre plan; it exists so a broken or degenerate primary ranker is
+        # detectable instead of silently degrading every probability to zero.
+        self.cross_check_ranker = CascadeGNN()
 
     def build_graph(
         self,
@@ -144,6 +141,9 @@ class CascadePlanner:
                 "edges": [],
                 "hotspots": [],
                 "adjacency": {},
+                # analyze_snapshot() reads this key before its own `if not nodes`
+                # guard, so the empty graph must supply it too.
+                "node_index": {},
                 "summary": {
                     "node_count": 0,
                     "edge_count": 0,
@@ -324,17 +324,120 @@ class CascadePlanner:
                 "total_delta_v_ms": 0.0,
                 "cascade_depth": 0,
                 "agencies_involved": [],
+                "ranker_review": {
+                    "primary": "gat",
+                    "cross_check": "gnn",
+                    "primary_ok": True,
+                    "cross_check_ok": True,
+                    "fallback_used": False,
+                    "degraded": False,
+                    "disagreement_threshold": RANKER_DISAGREEMENT_THRESHOLD,
+                    "disagreement_count": 0,
+                    "max_disagreement": 0.0,
+                    "disputed_satellites": [],
+                },
             }
 
+        # ── Ranker scoring (P15/P16) ─────────────────────────────────────────
+        # The primary ranker drives the plan. The cross-check ranker never
+        # contributes; it only reports where the two disagree so a silently
+        # broken or degenerate primary is visible. Neither model's score is
+        # blended: they share a data generator, so agreement between them is
+        # weak evidence and a fused number would imply precision neither has.
+        ranker_review: dict[str, Any] = {
+            "primary": "gat",
+            "cross_check": "gnn",
+            "primary_ok": False,
+            "cross_check_ok": False,
+            "fallback_used": False,
+            "degraded": False,
+            "disagreement_threshold": RANKER_DISAGREEMENT_THRESHOLD,
+            "disagreement_count": 0,
+            "max_disagreement": 0.0,
+            "disputed_satellites": [],
+        }
+        maneuver_probability = np.zeros(len(nodes), dtype=float)
+        ranker_depth = np.zeros(len(nodes), dtype=int)
+
         try:
-            node_features, edge_index, edge_attr = self._build_gnn_inputs(nodes, edges, node_index, adjacency)
-            gnn_output = self.gnn.predict(node_features, edge_index, edge_attr)
-            maneuver_probability = gnn_output["maneuver_probability"]
-            gnn_depth = gnn_output["cascade_depth"]
+            node_features, edge_index, edge_attr = self._build_gnn_inputs(
+                nodes, edges, node_index, adjacency
+            )
         except Exception as error:
-            logger.warning("GNN cascade scoring failed, using fallback: %s", error)
-            maneuver_probability = np.zeros(len(nodes), dtype=float)
-            gnn_depth = np.zeros(len(nodes), dtype=int)
+            # Without a graph there is nothing for any ranker to score, and
+            # fabricating zeros here would produce a plausible-looking plan
+            # with no basis in the physics.
+            raise RuntimeError(
+                f"Could not build cascade graph inputs: {error}"
+            ) from error
+
+        primary_error: Exception | None = None
+        try:
+            primary_output = self.primary_ranker.predict(
+                node_features, edge_index, edge_attr
+            )
+            maneuver_probability = np.asarray(
+                primary_output["maneuver_probability"], dtype=float
+            )
+            ranker_depth = np.asarray(primary_output["cascade_depth"], dtype=int)
+            ranker_review["primary_ok"] = True
+        except Exception as error:
+            primary_error = error
+            logger.error("Primary cascade ranker (GAT) failed: %s", error)
+
+        try:
+            cross_output = self.cross_check_ranker.predict(
+                node_features, edge_index, edge_attr
+            )
+            cross_probability = np.asarray(
+                cross_output["maneuver_probability"], dtype=float
+            )
+            ranker_review["cross_check_ok"] = True
+        except Exception as error:
+            cross_probability = None
+            logger.error("Cross-check cascade ranker (GNN) failed: %s", error)
+
+        if not ranker_review["primary_ok"]:
+            if cross_probability is None:
+                # Both rankers are unavailable. Raising leaves the previous
+                # alert cache in place, so the UI keeps showing the last real
+                # plan. Emitting zeros instead would be a fresh, entirely
+                # fabricated plan that looks normal to the operator.
+                raise RuntimeError(
+                    "Both cascade rankers failed; refusing to emit a plan with "
+                    f"fabricated probabilities. primary={primary_error!r}"
+                )
+            # The primary failed but the cross-check is healthy: use it, and
+            # mark the result degraded so the UI can say so.
+            maneuver_probability = cross_probability
+            ranker_depth = np.asarray(cross_output["cascade_depth"], dtype=int)
+            ranker_review["fallback_used"] = True
+            ranker_review["degraded"] = True
+            ranker_review["degraded_reason"] = (
+                "Primary GAT ranker failed; probabilities came from the GNN "
+                "cross-check and are not attention-derived."
+            )
+        elif cross_probability is not None:
+            # Both healthy: report where they disagree. The primary still wins.
+            if cross_probability.shape == maneuver_probability.shape:
+                delta = np.abs(cross_probability - maneuver_probability)
+                disputed = np.flatnonzero(
+                    delta > RANKER_DISAGREEMENT_THRESHOLD
+                )
+                ranker_review["disagreement_count"] = int(disputed.size)
+                ranker_review["max_disagreement"] = (
+                    round(float(delta.max()), 4) if delta.size else 0.0
+                )
+                ranker_review["disputed_satellites"] = [
+                    {
+                        "satellite_id": int(nodes[i].norad_id),
+                        "satellite_name": nodes[i].name,
+                        "gat_probability": round(float(maneuver_probability[i]), 4),
+                        "gnn_probability": round(float(cross_probability[i]), 4),
+                        "delta": round(float(delta[i]), 4),
+                    }
+                    for i in disputed
+                ]
 
         ranked_nodes = sorted(
             nodes,
@@ -360,7 +463,7 @@ class CascadePlanner:
             node_index=node_index,
             adjacency=adjacency,
             maneuver_probability=maneuver_probability,
-            gnn_depth=gnn_depth,
+            ranker_depth=ranker_depth,
             max_depth=max_depth,
             max_maneuvers=max_maneuvers,
             cpi_threshold=cpi_threshold,
@@ -386,6 +489,7 @@ class CascadePlanner:
             "agencies_involved": agencies_involved,
             "cpi_threshold": cpi_threshold,
             "optimization": optimization_summary,
+            "ranker_review": ranker_review,
             "node_probabilities": {
                 str(node.norad_id): round(float(maneuver_probability[node_index[node.norad_id]]), 3)
                 for node in nodes
@@ -399,7 +503,7 @@ class CascadePlanner:
         node_index: dict[int, int],
         adjacency: dict[int, list[dict[str, Any]]],
         maneuver_probability: np.ndarray,
-        gnn_depth: np.ndarray,
+        ranker_depth: np.ndarray,
         max_depth: int,
         max_maneuvers: int,
         cpi_threshold: float,
@@ -422,7 +526,7 @@ class CascadePlanner:
             threat_node = nodes[node_index[threat["target_id"]]]
             node_prob = float(maneuver_probability[node_index[sat_id]])
             local_cpi = float(threat["cpi_score"])
-            cascade_depth_score = int(max(depth, int(gnn_depth[node_index[sat_id]])))
+            cascade_depth_score = int(max(depth, int(ranker_depth[node_index[sat_id]])))
 
             maneuver_rsw = self._recommend_maneuver_rsw(node, threat_node, local_cpi, node_prob)
             maneuver_eci = rsw_to_eci(maneuver_rsw, node.position, node.velocity)
@@ -625,15 +729,12 @@ class CascadePlanner:
         return {agency: idx + 1 for idx, agency in enumerate(agencies)}
 
     def _compute_cpi(self, miss_distance_km: float, relative_velocity_kms: float, tca_minutes: float, p_collision: float) -> float:
-        miss_component = max(0.0, 10.0 - (miss_distance_km / 5.0))
-        velocity_component = min(relative_velocity_kms / 1.5, 10.0)
-        time_component = max(0.0, 10.0 - (tca_minutes / 2.4))
-        probability_component = max(0.0, min(10.0, p_collision * 10.0))
-        return (
-            0.40 * probability_component
-            + 0.25 * miss_component
-            + 0.20 * velocity_component
-            + 0.15 * time_component
+        from app.core.conjunction import compute_cpi_score
+        return compute_cpi_score(
+            probability_of_collision=float(p_collision),
+            miss_distance_km=float(miss_distance_km),
+            tca_hours=max(0.0, float(tca_minutes)) / 60.0,
+            relative_velocity_kms=float(relative_velocity_kms),
         )
 
     def _strongest_threat(self, sat_id: int, adjacency: dict[int, list[dict[str, Any]]]) -> dict[str, Any] | None:
@@ -679,6 +780,7 @@ class CascadePlanner:
             hotspot_position = item.get("hotspot_position") or {"x": 0.0, "y": 0.0, "z": 0.0}
             normalized.append(
                 {
+                    "id": f"{item['source_id']}-{item['target_id']}",
                     "sat1": {"id": item["source_id"], "name": item["source_name"]},
                     "sat2": {"id": item["target_id"], "name": item["target_name"]},
                     "miss_distance_km": item["predicted_miss_distance_km"],
