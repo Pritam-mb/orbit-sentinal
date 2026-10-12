@@ -196,7 +196,7 @@ Total (representative run) & & 0.950\
 
 ## Maneuver Verification
 
-Regression tests exercise the planner on constructed encounters. In one test, the naive minimum-$`\Delta v`$ burn, executed on a clone of the satellite, brings the maneuvering satellite within 30 m of a third payload, which full screening confirms. The planner marks that option as not cascade-safe, matches the secondary miss distance to within 50 m, and selects a different burn that still reaches $`P_c<10^{-6}`$. In a separate test, the planner’s predicted post-burn miss distance equals the executed result to within 10 m and its predicted TCA to within 1 s. The two-body Clohessy–Wiltshire along-track drift agrees with numerical propagation to within 0.5% (or 2 m) for burns of up to 0.05 m/s over 2 h, and the rocket-equation propellant mass agrees with Runge–Kutta integration of the mass flow to within $`10^{-6}`$ relative error.
+Regression tests exercise the planner on constructed encounters. In one test, the naive minimum-$`\Delta v`$ burn, executed on a clone of the satellite, brings the maneuvering satellite within 30 m of a third payload, which full screening confirms. The planner marks that option as not cascade-safe, matches the secondary miss distance to within 50 m, and selects a different burn that still reaches $`P_c<10^{-6}`$. In a separate test, the planner’s predicted post-burn miss distance equals the executed result to within 10 m and its predicted TCA to within 1 s. The two-body Clohessy–Wiltshire along-track drift agrees with numerical propagation to within 0.5% (or 2 m) for burns of up to 0.05 m/s over 2 h.
 
 ## Surrogate Accuracy and Explanations
 
@@ -233,7 +233,9 @@ Orbital Sentinel couples future-window screening, cross-checked Foster collision
 
 # Acknowledgment
 
-The authors thank CelesTrak and the U.S. Space Force Space-Track service for publicly available TLE and SATCAT data, and the maintainers of the open-source sgp4, SciPy, XGBoost, PyTorch, and CesiumJS projects.
+The authors thank CelesTrak and Space-Track for public TLE and SATCAT data, and the maintainers of sgp4, SciPy, XGBoost, PyTorch, and CesiumJS.
+
+*Use of AI-generated content:* Claude Opus 5.5 (Anthropic), a large language model, drafted and edited the text of all sections, generated the LaTeX source of the figures and tables from values produced by the authors’ software, helped check the references, and was used to review and correct parts of the software described in Sections III and IV. All reported results come from running that software. The authors reviewed all content and take full responsibility for it.
 
 # References
 
