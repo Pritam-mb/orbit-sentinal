@@ -186,9 +186,11 @@ manoeuvres, then publish.
   fragments are propagated, each carrying weight `N_total/N_sampled`.
 * **Fragment-vs-catalogue screening:** KD-tree over a 6 h window at a 30 s
   step with a 5 km threshold. Pc uses an isotropic Foster (non-central χ²).
-  Satellite σ is 0.2 km; fragment σ grows by 1 m/s × t. The resulting alerts
-  have `source: "debris"`, a `parent_event`, and the fragment state at the
-  alert epoch.
+  Satellite σ is 0.2 km; fragment σ grows by 1 m/s × t. The satellite's
+  hard-body radius comes from the same radius model as screening (§3,
+  `screening.object_meta`, tagged `hbr_source`), plus half the fragment size.
+  The resulting alerts have `source: "debris"`, a `parent_event`, and the
+  fragment state at the alert epoch.
 * **Masses (`mass_source`):** scenario config, then SATCAT RCS class (S/M/L
   → 50/500/2000 kg), then object type (PAY 800, R/B 1500, DEB 20 kg), then a
   default of 500 kg. **SATCAT has no masses**, so these are assumptions, and

@@ -97,12 +97,17 @@ def test_monotone_in_miss_distance():
 def test_score_alert_is_fast():
     alert = {"miss_distance_km": 0.4, "relative_speed_kms": 9.0, "p_collision": 1e-5}
     risk_api.score_alert(alert, record=False)
-    n = 500
-    t = time.perf_counter()
-    for _ in range(n):
-        risk_api.score_alert(alert, record=False)
-    per_alert_ms = (time.perf_counter() - t) / n * 1e3
-    assert per_alert_ms < 1.0, per_alert_ms
+    n = 200
+    # Best of several batches: measures the scoring cost, not scheduler noise
+    # from other processes (a single wall-clock sample was flaky on laptops).
+    batches = []
+    for _ in range(5):
+        t = time.perf_counter()
+        for _ in range(n):
+            risk_api.score_alert(alert, record=False)
+        batches.append((time.perf_counter() - t) / n * 1e3)
+    per_alert_ms = min(batches)
+    assert per_alert_ms < 1.0, batches
 
 
 def test_metrics_report_card_not_training_formula():

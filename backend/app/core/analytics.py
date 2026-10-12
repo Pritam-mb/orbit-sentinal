@@ -19,7 +19,8 @@ This module keeps the reference implementations that cross-check it:
                             label the ML surrogate's training set)
   * foster_integrate_dblquad - independent adaptive-quadrature Foster Pc used
                             in tests/test_screening_real.py to verify foster_pc
-  * _chan_approximation   - Chan (1997) first-term series (dblquad fallback)
+  * _chan_approximation   - Chan (1997/2008) full series via pc_methods.chan_pc
+                            (dblquad fallback)
 (The former compute_collision_probability / nasa_fragment_count helpers were
 removed: they were unused by the pipeline and carried an assumed 500 kg mass
 and an ad-hoc "affection rate". The real NASA SBM lives in app/core/breakup.py.)
@@ -183,28 +184,17 @@ def _chan_approximation(
     hbr_km: float,
 ) -> float:
     """
-    Chan (1997) series approximation for collision probability.
-    Fast fallback when numerical integration is unavailable or slow.
+    Chan (1997/2008) equivalent-area series, used when dblquad fails or times out.
 
-    Reference: Chan, F.K. (1997). "Spacecraft Collision Probability."
+    Delegates to app.core.pc_methods.chan_pc, the full series (exact for an
+    isotropic covariance). The former single-term isotropic approximation
+    u*exp(-(u+x))*I0(2*sqrt(u*x)) was 23 % low at zero miss and ~5x high at
+    10 sigma, so it is no longer used anywhere.
     """
     try:
-        b_vec_km = np.asarray(b_vec_km, dtype=float)
-        cov_2d_km2 = np.asarray(cov_2d_km2, dtype=float)
+        from app.core.pc_methods import chan_pc
 
-        sigma_sq = float(np.trace(cov_2d_km2)) / 2.0
-        if sigma_sq < 1e-20:
-            return 0.0
-
-        miss_sq = float(b_vec_km @ b_vec_km)
-        u = hbr_km**2 / (2.0 * sigma_sq)
-        x = miss_sq / (2.0 * sigma_sq)
-
-        # Chan series: Pc ≈ u * exp(-(u+x)) * I0(sqrt(4*u*x)) — first term approximation
-        # Using modified Bessel function of the first kind, order 0
-        from scipy.special import iv as bessel_iv
-        val = u * math.exp(-(u + x)) * float(bessel_iv(0, 2.0 * math.sqrt(u * x)))
-        return float(np.clip(val, 0.0, 1.0))
+        return chan_pc(np.asarray(b_vec_km, dtype=float), np.asarray(cov_2d_km2, dtype=float), float(hbr_km))
     except Exception as exc:
-        logger.debug("Chan approximation failed: %s — returning 0", exc)
+        logger.debug("Chan series failed: %s — returning 0", exc)
         return 0.0

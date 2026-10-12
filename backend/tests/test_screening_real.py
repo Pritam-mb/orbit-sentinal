@@ -160,6 +160,20 @@ def test_foster_quadrature_matches_dblquad():
         assert fast == pytest.approx(ref, rel=1e-4, abs=1e-14)
 
 
+def test_dblquad_fallback_is_exact_chan_series():
+    """The dblquad timeout fallback must be the full Chan series, not the
+    single-term approximation (23 % low at zero miss, ~5x high at 10 sigma)."""
+    from scipy.stats import ncx2
+
+    from app.core.analytics import _chan_approximation
+
+    sigma, hbr = 0.010, 0.010
+    C = np.eye(2) * sigma ** 2
+    for miss in (0.0, 0.01, 0.05, 0.1):
+        exact = ncx2.cdf((hbr / sigma) ** 2, 2, (miss / sigma) ** 2)
+        assert _chan_approximation(np.array([miss, 0.0]), C, hbr) == pytest.approx(exact, rel=1e-6)
+
+
 def test_covariance_grows_with_tle_age_and_severity_rule():
     s0 = S.tle_age_sigmas_km(0.0)
     s5 = S.tle_age_sigmas_km(5.0)

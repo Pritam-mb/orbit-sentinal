@@ -1,537 +1,306 @@
-# Orbital Sentinel: Explainable Real-Time Conjunction Assessment with Foster B-Plane Integration, Hermite TCA Refinement, and Layered Debris Forecasting
-
-**Authors:** [Author Names]  
-**Affiliation:** [Institution]  
-**Date:** September 2026  
-**Keywords:** space situational awareness, conjunction assessment, SGP4, Foster collision probability, B-plane integration, time of closest approach, debris visualization, cascade risk, graph neural networks
-
----
-
-## Abstract
-
-Orbital Sentinel is a prototype for real-time satellite tracking, conjunction awareness, risk ranking, and three-dimensional incident visualization. The system integrates Two-Line Element (TLE) ingestion, SGP4 propagation, a FastAPI service layer, and a Cesium-based WebGL client connected via REST and WebSocket. The collision-probability path implements the Foster (1992) B-plane double-integration method with an RTN covariance model and a Chan (1997) series fallback; risk ranking employs an XGBoost classifier trained on Foster-generated synthetic data alongside two graph cascade rankers — a deterministic surrogate over graph summary statistics and a multi-head graph attention network — for maneuver-probability and cascade-depth estimation. This paper documents the full implemented methodology, identifies and corrects eleven material defects present in earlier prototype versions, and evaluates all corrected paths through targeted regression tests. Five defects concern the physics and rendering path: collision probability was invariant to miss distance, TCA was confined to the numerical sample grid, incident markers were placed at the initial epoch, near-misses generated debris events, and multi-layer debris forecast shells were collapsed to a single sphere in the client. Four concern machine-learned components and their honest reporting: the attention ranker was an unimplemented stub that silently reported another model's scores as its own, the entire alert pipeline was disabled under the default configuration, ranker failure was converted into a plausible-looking all-zero maneuver plan, and the deployed risk-scorer metrics had been reported from a model that never served alerts. Two further defects affected alert dissemination: alert count and list could disagree, and TCA urgency was measured against wall-clock time rather than the snapshot epoch. All 116 backend tests pass. Cached evaluation on Foster-derived synthetic data reports 75.46% accuracy for the production risk scorer at 44.64% recall, 98.76% for the surrogate graph ranker, and 95.54% for the attention ranker. These figures characterize internal synthetic-set behavior and do not constitute operational flight-validation claims. The resulting architecture provides a reproducible, explainable platform for conjunction-response demonstrations and serves as a controlled baseline for future validation against independent conjunction truth data.
-
----
-
-## I. Introduction
-
-The cataloged orbital population now exceeds 27,000 tracked objects, and the number of untracked debris fragments with lethal collision cross-section is estimated at several hundred thousand [1]. As constellation deployment accelerates, the number of object pairs requiring daily screening grows as the square of the catalog size, placing increasing pressure on space situational awareness (SSA) infrastructure. Prototype systems that expose the geometry, timing, uncertainty, and downstream consequences of encounters in a transparent, debuggable architecture serve an important role: they allow methodology auditing, operator training, and controlled comparison of algorithmic choices before operational commitment.
-
-Orbital Sentinel addresses this need with an end-to-end pipeline: orbital states are propagated from TLEs via SGP4, cached, screened for close approaches, ranked by risk, streamed over WebSocket, and rendered on an interactive Cesium globe. The system additionally contains demo-specific logic, synthetic machine-learning artifacts, and a test router for injecting deterministic encounter scenarios. These components create a precise reporting obligation — implementation outputs must not be conflated with operationally validated collision probabilities. This paper enforces that boundary throughout.
-
-### A. Research Questions
-
-1. Does collision probability respond to both positional uncertainty and the relative miss vector in the B-plane?
-2. Can the TCA routine detect a close approach that occurs between coarse numerical output samples?
-3. Are hotspot and debris products located at the computed encounter position rather than the initial epoch?
-4. Does the Cesium client preserve the multi-layer debris forecast-shell structure supplied by the backend?
-
-### B. Contributions
-
-This work contributes:
-- A code-grounded system description of the full Orbital Sentinel pipeline, traced to implementation files
-- Documentation of the Foster B-plane collision probability pipeline and its RTN covariance model
-- A defect-focused correction set addressing eleven implementation errors, five in the physics and rendering path and six in the machine-learned and dissemination paths
-- A regression suite of 116 executable tests with deterministic acceptance criteria
-- Quantitative vector results for corrected probability, TCA refinement, and debris layering
-- An evidence-calibrated interpretation of synthetic model metrics that clearly delineates operational validity boundaries, including explicit disclosure of the production risk scorer's 44.64% recall
-
-No new software packages were downloaded for the analysis or artifact generation. All evidence derives from the repository source, installed runtime capabilities, and the regression test suite.
-
-### C. Paper Organization
-
-Section II describes the system architecture and data flow. Section III formalizes the implemented methodology, including the Foster B-plane path, RTN covariance model, Hermite TCA refinement, XGBoost risk scorer, trajectory predictor, graph cascade models, NASA EVOLVE debris simulation, and Cesium visualization pipeline. Section IV records the corrective implementations. Sections V and VI define the evaluation protocol and present results. Sections VII and VIII discuss limitations and conclusions.
-
----
-
-## II. System Architecture
-
-### A. Operational Data Flow
-
-The runtime data flow follows a linear pipeline:
-
-```
-TLE File → SGP4 Propagator → State Cache → Conjunction Screener
-    → Foster Pc Engine → CPI Scorer → XGBoost Risk Scorer
-    → KD-Tree Graph Builder → GAT Cascade Ranker (production)
-                                └→ GNN Cross-Check (reports disagreement only)
-    → REST / WebSocket → Cesium Globe Client
-```
-
-TLE records are ingested from a bundled snapshot at startup (`backend/app/simulation/tle-data.txt`). The SGP4 propagator (`sgp4_propagator.py`) evaluates Earth-centered inertial (ECI) position and velocity at the requested epoch. A state cache stores the most recent propagated snapshot and serves REST and WebSocket consumers at 1 Hz. Conjunction screening (`conjunction.py`) operates on the cached snapshot; cascade planning (`cascade_planner.py`, `gat_cascade.py`, `gnn_cascade.py`) operates on the resulting proximity graph. Debris products are produced by two complementary layers: an EVOLVE fragment simulation in `core/debris_model.py` and a predictive forecast-cloud integrator in `services/debris_model.py`, both served to the client with a `debris_source` discriminator. The test router (`routers/`) accepts injected ECI encounter scenarios for deterministic validation.
-
-### B. Backend Component Map
-
-| File | Responsibility |
-|------|---------------|
-| `sgp4_propagator.py` | TLE parsing, SGP4 integration, RSW→ECI burn transforms |
-| `conjunction.py` | Pairwise screening, Foster Pc dispatch, CPI computation |
-| `analytics.py` | RTN covariance, B-plane transform, Foster double integration, Chan fallback, fragment count |
-| `debris_model.py` | NASA EVOLVE fragment generation, drag-aware propagation |
-| `cascade_planner.py` | KD-tree graph construction, CPI-weighted cascade expansion, ranker selection and failure handling |
-| `gnn_cascade.py` | Graph cascade ranker over fixed graph summary statistics; runs as a cross-check, contributes nothing to the plan |
-| `gat_cascade.py` | Multi-head graph attention ranker; the sole production ranker for maneuver probability and cascade depth |
-| `xgboost_scorer.py` | XGBoost classifier on Foster-derived features, boosted-stump fallback |
-| `satellite_state_tracker.py` | State aggregation and Kalman-augmented tracking |
-| `model_metrics.py` | Artifact-signature metric cache, per-model independence flags, `graph_attention` status block |
-
-### C. Frontend Architecture
-
-The React client (`frontend/src/`) uses Cesium for globe rendering and Zustand for state management. It bootstraps through REST (`/api/satellites`, `/api/alerts`), then maintains a WebSocket connection for live 1 Hz position updates. Alerts, hotspots, the cascade plan, the proximity graph, and the ranker review block are pushed over the same socket, so the operator view updates without polling; the client reconciles the pushed set against the REST response using a single merge rule. Between updates, each satellite is advanced using linear ECI extrapolation with the stored velocity vector. ECI coordinates are converted to Cesium Cartesian using Greenwich Mean Sidereal Time (GMST). Separate entity collections represent satellites, orbit polylines, conjunction hotspots, approach lines, and debris forecast shells. A status strip reports backend, pipeline, model-training, physics, and cascade-ranker health, with the ranker indicator distinguishing healthy, disputed, and degraded states.
-
-### D. Data and Model Provenance
-
-| Source | Description | Operational Interpretation |
-|--------|-------------|---------------------------|
-| TLE snapshot | Bundled SGP4-derived state estimate | State accuracy limited by TLE age and maneuver history |
-| Foster synthetic data | Conjunction pairs generated by the analytics pipeline | Internal classification surrogate; not CDM-validated |
-| Graph snapshots | Synthetic proximity graphs | Internal cascade-ranking evaluation only; not real conjunction histories |
-| Test scenarios | Injected ECI encounters | Deterministic UI and solver validation |
-| `model_metrics_cache.json` | Evaluation on above synthetic sets (25 September 2026) | Internal synthetic-set reproducibility only |
-
-**Evidence boundary:** No external conjunction data messages (CDMs), independent truth ephemerides, or operator-validated encounter records were present in the repository. Metric claims are constrained to internal synthetic evaluation.
-
----
-
-## III. Methodology
-
-### A. Orbit Propagation
-
-The SGP4 propagator converts TLE records to `Satrec` objects using the `python-sgp4` library (Vallado et al., 2006 [2]). For each satellite, ECI position $\mathbf{r}(t)$ and velocity $\mathbf{v}(t)$ are evaluated at the requested epoch. Scalar speed and approximate altitude are:
-
-$$v_{kmh} = \|\mathbf{v}\| \times 3600 \quad \text{(km/h)}$$
-$$h_{km} = \|\mathbf{r}\| - R_E \quad \text{(km, } R_E = 6371 \text{ km)}$$
-
-**Maneuver integration:** Impulsive delta-V burns are accepted in ECI or converted from RSW (Radial/Along-track/Cross-track) frame. The RSW basis is:
-
-$$\hat{R} = \frac{\mathbf{r}}{\|\mathbf{r}\|}, \quad \hat{W} = \frac{\mathbf{r} \times \mathbf{v}}{\|\mathbf{r} \times \mathbf{v}\|}, \quad \hat{S} = \hat{W} \times \hat{R}$$
-
-The post-burn state is converted to osculating Keplerian elements; the burn is rejected if the predicted perigee drops below 100 km. A new `Satrec` is rebuilt so future propagation uses the updated orbit.
-
-### B. RTN Covariance Model
-
-When external covariance data is unavailable (the common case for TLE-sourced catalog objects), `analytics.py` builds a 3×3 ECI position covariance via an RTN (Radial/Transverse/Normal) uncertainty model:
-
-$$\sigma_R = 50 \text{ m}, \quad \sigma_T = 1.0 \times \left(1 + \frac{t_{age}}{24}\right) \text{ km}, \quad \sigma_N = 50 \text{ m}$$
-
-The transverse uncertainty grows linearly with TLE age $t_{age}$ in hours, reflecting the dominant along-track prediction error characteristic of TLE-based propagation. The combined ECI covariance is:
-
-$$\mathbf{C}_{ECI} = \mathbf{R}_{RTN}\, \text{diag}[\sigma_R^2, \sigma_T^2, \sigma_N^2]\, \mathbf{R}_{RTN}^T$$
-
-where $\mathbf{R}_{RTN}$ is the rotation matrix whose columns are $\hat{R}$, $\hat{T}$, $\hat{N}$ expressed in ECI.
-
-### C. B-Plane Collision Probability (Foster 1992)
-
-The collision probability path in `analytics.py` implements the Foster and Estes (1992) [3] B-plane method as used by NASA CARA.
-
-**B-plane construction:** The B-plane is perpendicular to the relative velocity vector $\Delta\mathbf{v} = \mathbf{v}_q - \mathbf{v}_p$ at TCA. Unit vectors are:
-
-$$\hat{h} = \frac{\Delta\mathbf{v}}{\|\Delta\mathbf{v}\|}, \quad \hat{t} = \frac{\hat{h} \times \mathbf{r}_p}{\|\hat{h} \times \mathbf{r}_p\|}, \quad \hat{n} = \hat{t} \times \hat{h}$$
-
-The projection matrix is $\mathbf{B} = [\hat{t}\;;\;\hat{n}] \in \mathbb{R}^{2\times 3}$.
-
-**Miss vector:** The combined position delta $\Delta\mathbf{r} = \mathbf{r}_q - \mathbf{r}_p$ is projected into the B-plane:
-
-$$\mathbf{b} = \mathbf{B}\,\Delta\mathbf{r} = [B_T,\, B_N]^T \quad \text{(km)}$$
-
-**Combined covariance:** The sum of individual ECI covariances is projected onto the B-plane:
-
-$$\mathbf{C}_{2D} = \mathbf{B}\,(\mathbf{C}_p + \mathbf{C}_q)\,\mathbf{B}^T \in \mathbb{R}^{2\times 2}$$
-
-**Foster integration:** Collision probability is the integral of the bivariate Gaussian PDF over the circular hard-body disk of radius $R_{HBR} = 10$ m:
-
-$$P_c = \iint_{x^2+y^2 \leq R_{HBR}^2} \mathcal{N}(\mathbf{x};\, \mathbf{b},\, \mathbf{C}_{2D})\, dx\, dy$$
-
-This is evaluated by `scipy.integrate.dblquad` with a 2-second timeout. If integration exceeds the timeout or fails, the Chan (1997) [4] series approximation provides a fast fallback:
-
-$$P_c^{Chan} \approx u \cdot e^{-(u+x)} \cdot I_0\!\left(2\sqrt{ux}\right)$$
-
-where $u = R_{HBR}^2 / (2\sigma^2)$, $x = \|\mathbf{b}\|^2 / (2\sigma^2)$, $\sigma^2 = \text{tr}(\mathbf{C}_{2D})/2$, and $I_0$ is the modified Bessel function of the first kind. The result is clipped to $[0,1]$.
-
-### D. Conjunction Priority Index (CPI)
-
-The CPI provides a scalar urgency score on $[0, 10]$ calibrated against the Foster $P_c$ ordering. The five sub-scores are weighted to ensure CPI rank equals Foster $P_c$ rank for comparable encounters:
-
-| Component | Weight | Mapping |
-|-----------|--------|---------|
-| Miss distance | 0.40 | Piecewise linear on $[0,500]$ km |
-| Foster $P_c$ (log) | 0.30 | Linear in $\log_{10}(P_c) \in [-6,-2] \to [0,10]$ |
-| TCA urgency | 0.15 | Piecewise linear on $[0,24]$ h |
-| Closing speed | 0.10 | Linear, capped at 15 km/s |
-| TLE data age | 0.05 | Linear, capped at 48 h |
-
-**NASA CARA threshold alignment:**
-- $P_c \geq 10^{-4}$ (CPI $\approx$ 5.0): watch/elevated concern
-- $P_c \geq 10^{-3}$ (CPI $\approx$ 7.5): action threshold
-- $P_c \geq 10^{-2}$ (CPI $\approx$ 10): emergency — maneuver required
-
-### E. TCA Refinement: Cubic Hermite Interpolation
-
-The coarse TCA search evaluates ECI states at uniform time steps. The corrected method identifies the two time intervals adjacent to the coarse minimum-separation sample and fits cubic Hermite position curves from endpoint positions and velocities. The relative separation within each bracket is:
-
-$$d(t)^2 = \|\mathbf{r}_{rel}(t)\|^2 = \|\mathbf{r}_1(t) - \mathbf{r}_2(t)\|^2$$
-
-Hermite interpolation within interval $[t_k, t_{k+1}]$ gives a $C^1$ continuous relative trajectory. Minimizing $d^2$ via `scipy.optimize.minimize_scalar` over each bracket yields sub-step temporal localization. This reduces sample-grid aliasing without requiring a full re-integration.
-
-Additionally, the target-time endpoint is corrected so the propagation loop terminates at the requested horizon $T$ exactly, preventing overshoot that caused the prior implementation to miss the final sample.
-
-### F. XGBoost Risk Scorer
-
-The risk scorer (`xgboost_scorer.py`) uses a Foster-trained XGBoost classifier as its primary path. The eight input features are:
-
-$$\mathbf{f} = [d_{miss},\; v_{rel},\; t_{TCA},\; t_{age},\; h_{alt},\; \sigma_R^2,\; \sigma_T^2,\; \sigma_N^2]$$
-
-Training data is generated by the `generate_risk_dataset` function in `synthetic_data.py`, which calls the Foster B-plane pipeline to produce $(P_c, \text{features})$ pairs. Binary labels are obtained by thresholding $P_c \geq 0.5$. The XGBoost model is saved to `risk_model_trained.json` and loaded at module import. If XGBoost is unavailable (no library), the system falls back to a compact gradient-boosted stump ensemble (`BoostedRiskModel`) trained on the same synthetic data.
-
-The measured behavior of this model through its production scoring entry point is reported in Section VI.E: 75.46% accuracy at 44.64% recall. The high precision (87.83%) paired with low recall indicates a conservative scorer that rarely raises a false alarm but misses most positives at the 0.5 decision threshold. This is a property of the trained model on a class-imbalanced synthetic distribution, and is carried forward as an open limitation rather than corrected; the earlier higher figure attributed to this component came from a fallback model outside the request path (Section IV.I).
-
-### G. Trajectory Predictor
-
-The trajectory predictor (`lstm_predictor.py`) consumes a ring buffer of the 100 most recent $(\tau, \mathbf{r})$ samples and rolls forward a single hidden state:
-
-$$\mathbf{z}_t = \mathbf{x}_t \mathbf{W}_x + \mathbf{h}_{t-1} \mathbf{W}_h + \mathbf{b}, \qquad \mathbf{h}_t = \tanh(\mathbf{z}_t), \qquad \hat{\mathbf{y}}_t = \mathbf{h}_t \mathbf{W}_y + \mathbf{b}_y$$
-
-with $\mathbf{h}_0 = \mathbf{0}$. Despite the module name, this is a single-tanh Elman recurrent cell with no input, forget, or output gates, and therefore not an LSTM. It is trained by SGD on synthetic coordinate sequences and serves `/api/satellites/{id}/orbit` and the anomaly detector. The filename overstates the architecture; the equations above are the implemented model, and the distinction is noted here so the measured MAE is not attributed to gated memory.
-
-### H. Graph Cascade Models
-
-The cascade planner (`cascade_planner.py`) builds a proximity graph using a KD-tree with an influence radius of 200 km. Each edge stores: miss distance, predicted miss distance, relative velocity, TCA, $P_c$, CPI score, severity, and inverse-distance influence weight $w = 1/\max(d_{pred}, 1)$.
-
-Node features include ECI state components, altitude, speed, and peak-CPI from the strongest neighbor. The cascade rankers come in two variants. `gnn_cascade.py` is a deterministic surrogate that scores each node from fixed global summary statistics. `gat_cascade.py` is a genuine multi-head graph attention network: for each target node it takes a softmax over its in-edges *plus its own projected state*, so an isolated node falls back to full self-attention rather than collapsing to a constant. Each head has independent projections and attention vectors, the heads are concatenated, and an ELU nonlinearity precedes the linear readout. The attention weights are gradient-trained with PyTorch autograd on synthetic graph snapshots and exported to a JSON artifact, so runtime inference is deterministic NumPy and requires no deep-learning stack. Previously this module was gated behind the optional `torch_geometric` package, which is not installed; the import failed, and every call fell back to `CascadeGNN`, making the two models byte-identical aliases of each other. `CascadeGNN` now also runs inside the planner as a cross-check, but its scores are excluded from the published plan by design (see Section VII.C).
-
-Cascade depth is estimated as
-
-$$d_{casc} = \text{clip}\!\left(\left\lceil\, P_{man}\times 4 + w_{inf}\times 1.5 \,\right\rceil,\; 0,\; 4\right)$$
-
-**Maneuver recommendation.** Two distinct burn computations exist and should not be conflated. The planner's `_recommend_maneuver_rsw` derives the burn from alert physics alone, using the CPI of the strongest threat and the maneuver probability:
-
-$$\Delta v_{planner} = \text{clip}\!\left(0.15 + \frac{CPI}{10}\times 1.4 + P_{man}\times 0.7,\; 0.05,\; 2.5\right)$$
-
-split as radial 25%, along-track 85%, cross-track 15% of that magnitude, with each component's sign directed away from the threat. This is the value that reaches the operator, and it does not depend on which ranker is active.
-
-The ranker modules separately compute a model-internal along-track burn for use as a training target and for internal diagnostics:
-
-$$\Delta v_{along} = \text{clip}\!\left(0.05 + P_{man}\times 1.35 + \frac{r_{local}}{12} + 0.2\,v_{bias},\; 0.05,\; 5.0\right)$$
-
-with radial and cross-track components $\text{clip}((r_{local}-0.5)\times 0.25, \pm1)$ and $\text{clip}((w_{inf}-0.35)\times 0.22, \pm1)$. These use the ranker's own learned features rather than the alert's CPI, and are not the burn shown to the operator. The distinction matters because the two have different units of driver ($CPI$ versus model features) and different clip ceilings (2.5 versus 5.0 m/s); a description that quoted a single formula would misstate which one governs the published plan.
-
-### I. Debris Forecast Model
-
-The debris model (`debris_model.py`) implements the NASA EVOLVE 4.0 Standard Breakup Model [5]. Fragment sizes follow a power-law CDF inversion:
-
-$$L = L_{min} \cdot (1 - u)^{-1/1.6}, \quad u \sim \text{Uniform}(0,1)$$
-
-Fragment velocity kicks follow the NASA EVOLVE characteristic velocity:
-
-$$\Delta v_{mean} = \frac{200}{\sqrt{L}} \; \text{m/s}, \quad \Delta v \sim \text{LogNormal}(\mu, \sigma)$$
-
-where $\mu = \ln(\Delta v_{mean}) - \sigma^2/2$ and $\sigma^2 = \ln(1 + 0.16)$.
-
-Catastrophic/sub-catastrophic threshold: specific energy $E/M > 40$ J/kg. Fragment count is estimated from the NASA breakup formula:
-
-$$N = 0.1 \times (M_1 + M_2)^{0.75} \times \begin{cases} 1 & \text{catastrophic} \\ 0.1 & \text{cratering} \end{cases}$$
-
-Fragment propagation uses two-body gravity plus an Euler-integrated atmospheric drag term:
-
-$$a_{drag} = -\frac{1}{2} C_D \frac{A}{m} \rho(h) v_{ms}^2 \hat{v}$$
-
-with $C_D = 2.2$ and exponential atmospheric density scaling from sea-level reference.
-
-### J. Cesium Globe Pipeline
-
-Between 1 Hz backend updates, the client advances each satellite by linear ECI extrapolation: $\mathbf{r}_{adv} = \mathbf{r} + \mathbf{v} \cdot \Delta t$. ECI is converted to Cesium Cartesian via GMST rotation. The orbit track is segmented when adjacent samples diverge by more than 8000 km to prevent cross-arc line artifacts. Hotspot, approach-line, and debris-shell entities are updated from the alert REST response on each polling cycle.
-
----
-
-## IV. Corrective Implementation
-
-Table I summarizes the eleven defects identified through code inspection and the corrections applied. Defects 1–5 concern the physics and rendering path. Defects 6–9 concern machine-learned components and the honesty of their reporting. Defects 10–11 concern alert dissemination.
-
-### Table I: Defect–Correction Summary
-
-| # | Component | Defect Observed | Root Cause | Correction Applied | Behavioral Effect |
-|---|-----------|----------------|------------|-------------------|------------------|
-| 1 | Collision probability | $P_c$ invariant to miss distance | Chi-square approximation used only covariance trace, ignoring $\mathbf{b}$ | Foster B-plane double integration with projected miss vector | $P_c$ decreases monotonically with miss distance |
-| 2 | TCA refinement | Close approach between coarse samples missed; endpoint overshoot | Linear interpolation without sub-step search; loop counter off by one | Cubic Hermite minimization in adjacent intervals; exact endpoint fix | Improved temporal localization; target-time compliance |
-| 3 | Hotspot placement | Incident marker at initial epoch position, not TCA position | Test router used snapshot positions at $t=0$ rather than solver output | Hotspot midpoint computed from solver states at refined TCA | Correct incident location displayed in Cesium |
-| 4 | Debris semantics | Near-misses generated debris; expansion started before impact | Debris triggered on alert, not on collision detection; timeline not offset | Debris only on confirmed collision ($d < 1$ m); post-impact timeline | Correct event semantics: no debris for near-misses |
-| 5 | Debris layers | All shells collapsed to single opaque sphere in Cesium | Client reduced shell array to maximum-radius scalar | One translucent `EllipsoidGraphics` per unique positive-radius shell | Multi-layer forecast structure preserved and visible |
-| 6 | GAT cascade ranker | Attention model reported byte-identical scores to the GNN | Only implementation gated behind uninstalled `torch_geometric`; import failed and every call fell through to `CascadeGNN` | Trained multi-head attention network with self-state in the segment softmax, exported to JSON | Two genuinely distinct rankers (95.54% vs 98.76%) |
-| 7 | Alert pipeline | Conjunction screening, cascade planning, hotspots and debris never executed under the default configuration | `ENABLE_EXTENDED_PIPELINE` guard placed at the top of the alert refresh, though the flag exists only to skip optional ML runtime and Kafka | Guard narrowed to the optional subsystems; core pipeline always runs | `/api/alerts` serves a populated payload instead of the startup stub |
-| 8 | Cascade ranker | Any ranker exception was replaced with zero vectors, publishing a fabricated plan as healthy | Single `try`/`except` around scoring substituted `np.zeros` for probability and depth | Failure raises, or returns real cross-check probabilities flagged `degraded` | Operator sees a hard error or an explicit degraded flag, never a plausible fake |
-| 9 | Risk-scorer reporting | 93.85% accuracy attributed to the deployed scorer | Metrics computed on a legacy boosted-stump model that never served alerts | Metrics regenerated through the production `XGBoostScorer.score` path | 75.46% accuracy, 44.64% recall — the deployed model's real performance |
-| 10 | Alert dissemination | `count` could disagree with `len(alerts)`; REST and WebSocket applied different merge rules | Duplicates resolved differently per transport | One dedup rule (graph entry preferred) applied everywhere | Count, list, and both transports always agree |
-| 11 | TCA urgency | Urgency computed against wall-clock time | Alert handler read `datetime.now()` instead of the snapshot epoch | Urgency measured from the snapshot timestamp | Urgency stable regardless of client/server clock skew |
-
-### A. Probability Correction (Defect 1)
-
-The former implementation computed:
-
-$$P_c^{old} \propto \text{gammainc}\!\left(1, \frac{R_{HBR}^2}{\text{tr}(\mathbf{C}_{2D})}\right)$$
-
-This expression depends only on the covariance trace and hard-body radius, making probability independent of where the objects actually pass relative to each other. The corrected path evaluates the full Foster integral over the B-plane Gaussian shifted by the miss vector $\mathbf{b}$, making $P_c$ a proper function of encounter geometry. A degenerate covariance (eigenvalue $< 10^{-20}$) still falls back to the Chan series approximation.
-
-### B. TCA Localization (Defect 2)
-
-The test solver (`conjunction_solver.py`) previously returned the coarse minimum without sub-step refinement. The corrected routine: (a) identifies the sample index achieving minimum separation, (b) applies Hermite minimization over the two adjacent intervals $[t_{k-1}, t_k]$ and $[t_k, t_{k+1}]$, and (c) corrects the integration step count so the final step lands exactly at the requested target time, eliminating endpoint overshoot.
-
-### C. Hotspot Relocation (Defect 3)
-
-The alert router previously populated hotspot coordinates from the cached snapshot at $t=0$. The corrected router passes the solver's refined encounter time and interpolated ECI states to the hotspot calculator, which computes the midpoint between the two object positions at TCA. This ensures the displayed hotspot and the approach-line endpoints correspond to the actual predicted encounter, not the initial epoch.
-
-### D. Debris Event Semantics (Defect 4)
-
-The former implementation created a debris event for any conjunction alert crossing the warning threshold, regardless of whether a collision was actually detected. The corrected logic separates two thresholds:
-- **Warning gate** ($d < 100$ m): creates a visual alert and approach marker in Cesium
-- **Collision gate** ($d < 1$ m): additionally creates a debris cloud via the EVOLVE model
-
-The debris timeline offset is corrected so the impact shell represents the state at $t_{TCA}$ rather than $t=0$.
-
-### E. Debris Layer Rendering (Defect 5)
-
-The frontend component previously iterated the `shells` array and retained only the last (maximum) radius, rendering a single opaque sphere. The corrected component: validates each shell for positive radius, sorts by radius, deduplicates, and creates one translucent `EllipsoidGraphics` entity per shell with opacity decreasing from impact to forecast horizon. This preserves the temporal expansion structure intended for operator situational awareness.
-
-### F. Attention Ranker Authenticity (Defect 6)
-
-`gat_cascade.py` previously gated its only implementation behind the optional `torch_geometric` package. Because that package is not installed, the import failed and every prediction fell through to `CascadeGNN`, so the "GAT Cascade" metrics row was a byte-for-byte copy of the "Graph Cascade" row — one model presented as two, with the second presented as independent corroboration.
-
-The replacement is a genuine multi-head graph attention network. For each target node it computes a softmax over its in-edges *plus its own projected state*, so an isolated node attends to itself rather than collapsing to a constant. Each head has independent projections and an attention vector; heads are concatenated, an ELU nonlinearity precedes a linear readout, and weights are gradient-trained with PyTorch autograd. Training requires only `torch`, which is already a dependency; runtime inference is deterministic NumPy reading a JSON artifact, so no deep-learning stack is needed in the serving path. Torch/NumPy forward parity is verified to $3.4\times10^{-7}$.
-
-The correction is visible in the artifact rather than only in prose: the metrics payload now carries a per-model `independent` flag and a `graph_attention` status block recording the trainer, head count, hidden dimension, epoch count, and a `degenerate` flag, so a future alias cannot be presented as corroborating evidence.
-
-### G. Alert Pipeline Availability (Defect 7)
-
-`refresh_alerts_once()` began with `if not ENABLE_EXTENDED_PIPELINE: return`. That flag exists to skip the optional heavy ML runtime and the Kafka publisher, but the guard sat at the top of the alert refresh, so under the default configuration the entire product pipeline — conjunction screening, cascade planning, hotspot generation and debris building — never executed, and `/api/alerts` served the empty startup stub indefinitely.
-
-The guard was narrowed to the optional subsystems. Core alerting now always runs. This is the single most consequential defect in the audit: every other numerical result in this paper describes code paths that, on a default deployment, were unreachable.
-
-### H. Cascade Ranker Failure Handling (Defect 8)
-
-The planner wrapped scoring in a single `try`/`except` that substituted zero vectors for maneuver probability and cascade depth, then published the resulting plan as healthy. Any ranker error — corrupt artifact, shape mismatch, missing torch, an ordinary bug — therefore produced a structurally valid, entirely fabricated plan with every probability at `0.0` and no degraded indication.
-
-The failure was not merely cosmetic. Because the downstream risk update subtracts a probability-proportional term, an all-zero input *inflated* the apparent post-manoeuvre safety margin and understated residual risk, and ranking fell back to peak CPI alone, so the plan looked plausible rather than obviously empty. The only distinguishing signal was a log line at `WARNING`.
-
-Failure is now typed and surfaced. If the primary attention ranker fails but the cross-check is healthy, the plan is scored by the cross-check and carries real probabilities with an explicit `degraded` flag and reason, and a status indicator turns red in the operator interface. If both fail, the planner raises, which preserves the last valid plan rather than replacing it with a fabricated one. A cross-check failure alone does not degrade a healthy primary.
-
-### I. Risk-Scorer Reporting (Defect 9)
-
-Reported accuracy for the risk scorer was 93.85%, computed on a legacy boosted-stump model that never served alerts. Metrics are now generated through the production `XGBoostScorer.score` entry point, yielding 75.46% accuracy at 44.64% recall. The lower figure describes the model actually in the request path.
-
-Recall of 44.64% means the deployed scorer misses more than half of positive cases at the 0.5 threshold. This is a real weakness of the production model, not a reporting artifact, and it is carried forward as an open item rather than resolved.
-
-### J. Alert List and Count Consistency (Defect 10)
-
-Duplicate alerts were resolved differently by the REST route and the WebSocket broadcaster, so `count` could disagree with `len(alerts)` and the two transports could show different alert sets for the same snapshot. Both paths now share one deduplication rule, which prefers a cascade-graph entry over a screening entry, and both WebSocket pushes and REST responses are merged consistently.
-
-### K. TCA Urgency Epoch (Defect 11)
-
-Alert urgency was computed against wall-clock time rather than the epoch of the snapshot being reported, making the displayed time-to-closest-approach depend on client/server clock skew. Urgency is now measured from the snapshot timestamp.
-
-### L. Regression Test Suite
-
-The suite contains 116 tests. Three target the original physics and rendering defects, and the remainder protect the alert pipeline, the attention ranker, the cross-check wiring, and the failure-handling paths.
-
-**Test 1 — Probability monotonicity:** Creates a 2D Gaussian with $\sigma = 10$ m per axis and $R_{HBR} = 10$ m. Asserts $P_c(d=0) > P_c(d=100\text{ m})$. This test fails under the former miss-independent implementation.
-
-**Test 2 — Sub-step TCA detection:** Configures two objects with opposing 2 m/s relative motion and true closest approach at $t = 5$ s, coarse samples at $t \in \{0, 7\}$ s. Asserts refined miss $< 0.1$ m and TCA within 0.05 s of truth.
-
-**Test 3 — Debris shell ordering:** Injects a collision at the snapshot epoch with a 2 h forecast. Asserts impact radius $<$ mid-horizon radius $<$ forecast-horizon radius (monotonically increasing shells).
-
----
-
-## V. Experimental Design
-
-### A. Evidence Sources
-
-1. Repository documentation: `README.md`, `PROJECT_SCENARIO.md`
-2. Source inspection of all files listed in Table I and Section II
-3. Saved model metric cache (`model_metrics_cache.json`, generated 25 September 2026)
-4. The 116-test regression suite executed in the repository environment
-5. In-process API verification against a 120-satellite TLE snapshot, confirming a populated `/api/alerts` payload under the default configuration
-
-### B. Test Definitions and Acceptance Criteria
-
-| Test | Configuration | Acceptance Criterion |
-|------|--------------|---------------------|
-| Probability sensitivity | $\sigma = 10$ m per axis; $R_{HBR} = 10$ m | $P_c(0\text{ m}) > P_c(100\text{ m})$ |
-| Sub-step TCA | Opposing 2 m/s; true TCA at 5 s; coarse at 0, 7 s | Miss $< 0.1$ m; TCA within 0.05 s |
-| Debris timeline | Impact at snapshot; 2 h forecast | $r_{impact} < r_{mid} < r_{forecast}$ |
-| Alert pipeline availability | Default configuration, no env overrides | Screening, cascade planning and debris each execute once per refresh |
-| Ranker failure (both models) | Both rankers raise | Planner raises; no all-zero plan is published |
-| Ranker failure (primary only) | Primary raises, cross-check healthy | Plan carries cross-check probabilities and `degraded: true` |
-| Cross-check independence | Cross-check returns inverted probabilities | Disagreement is reported; published probabilities remain the primary's, unblended |
-
-### C. Synthetic Metric Protocol
-
-The risk scorer is evaluated as a binary classifier: Foster-derived $P_c$ values are thresholded at 0.5 to produce labels, the scorer's continuous output is thresholded at 0.5 for predicted class, and standard classification metrics (accuracy, precision, recall, F1) are computed. Graph Cascade and GAT Cascade models use synthetic graph snapshots with the same binary threshold. The trajectory predictor is evaluated on next-position coordinates using MAE and RMSE.
-
-Cache sample counts: 4,096 risk samples, 2,985 graph-node samples per graph model, 768 coordinate values for trajectory regression.
-
-### D. Validity Boundary
-
-This evaluation explicitly does not claim: real-world recall, calibrated probability against operational CDMs, maneuver optimality, or catalog-scale latency performance. No comparison against external conjunction truth data is made because none was provided. The evaluation answers whether the corrected implementation paths are internally coherent and behave as designed under controlled, deterministic inputs.
-
----
-
-## VI. Results
-
-### A. Regression Outcomes
-
-| Test | Outcome | Observed Values |
-|------|---------|----------------|
-| Probability responds to miss | **PASS** | $P_c(0\text{ m}) = 0.3935$; $P_c(100\text{ m}) = 3.41 \times 10^{-20}$ |
-| TCA between coarse samples | **PASS** | Refined miss $< 0.1$ m; TCA $\approx 5.00 \pm 0.05$ s |
-| Debris shell ordering | **PASS** | Impact $<$ mid-horizon $<$ forecast-horizon (increasing radii) |
-| Alert pipeline runs by default | **PASS** | Screening, cascade planning and debris each execute once per refresh; 120 nodes, 9 alerts, `count == len(alerts)` |
-| Both rankers fail | **PASS** | `RuntimeError` raised; no all-zero plan published |
-| Primary ranker fails only | **PASS** | Plan carries cross-check probabilities; `degraded: true`, `fallback_used: true` |
-| Cross-check fails only | **PASS** | Plan unaffected; `cross_check_ok: false`, `degraded: false` |
-| Cross-check is not fused | **PASS** | Published probability equals the primary's, never an average of the two |
-| GAT/GNN forward parity | **PASS** | Torch vs NumPy max abs difference $3.4\times10^{-7}$ |
-| GAT is not an alias | **PASS** | Max $\lvert P_{GNN} - P_{GAT}\rvert = 0.349$ across 24 graphs |
-
-All 116 backend tests pass. The probability result spans twenty decades between the zero-miss and 100 m cases, confirming that the Foster integration is correctly sensitive to miss-vector offset. The former implementation would return identical values for both cases.
-
-### B. Operational Snapshot
-
-An in-process request against the default configuration with 120 TLE-derived satellites produced a populated alert payload: 120 graph nodes, 3 graph edges, 9 alerts, cascade depth 3, and 120 of 120 non-zero node probabilities. Both rankers reported healthy, with an observed maximum GAT/GNN probability delta of 0.257 against a review threshold of 0.25, which correctly raised a disagreement flag on one satellite. This is the defect-7 path: before the correction, the same request returned the empty startup stub.
-
-### C. Corrected Probability Response
-
-At zero miss distance, the computed probability (0.393) reflects the fraction of the $\sigma = 10$ m Gaussian that overlaps the $R_{HBR} = 10$ m disk when the Gaussian mean sits exactly at the disk center — a physically plausible result for two objects whose positional uncertainty envelopes fill the hard-body sphere. At 100 m separation (10$\sigma$), the value drops to $3.41 \times 10^{-20}$, consistent with the extreme tail of a bivariate Gaussian at 10 standard deviations from the mean.
-
-### D. Debris Envelope Radii
-
-The post-impact debris envelope at representative forecast times:
-
-| Forecast Horizon | Radius (km) |
-|-----------------|-------------|
-| 0 h (impact) | 1.500 |
-| 1 h | 211.704 |
-| 2 h | 319.626 |
-| 4 h | 403.483 |
-| 8 h | 431.414 |
-| 24 h | 433.500 |
-
-The asymptotic convergence reflects the exponential velocity decay in the EVOLVE model: fragment expansion speed decays as $v(t) = v_0 e^{-t/\tau}$, making the total radius approach a finite maximum.
-
-### E. Synthetic Model Performance
-
-| Model | Accuracy | Precision | Recall | F1 | Samples |
-|-------|----------|-----------|--------|-----|---------|
-| Risk Scorer (XGBoost) | 75.46% | 87.83% | 44.64% | 59.20% | 4,096 |
-| Graph Cascade (GNN) | 98.76% | 98.46% | 98.69% | 98.57% | 2,985 |
-| GAT Cascade | 95.54% | 94.76% | 94.98% | 94.87% | 2,985 |
-
-**Trajectory predictor:** MAE = 226.93 km, RMSE = 281.74 km across 768 coordinate values. The large absolute errors are expected for a lightweight linear predictor evaluated on broad synthetic orbital arcs; they should not be interpreted as orbit determination precision.
-
-**Interpretation:** The GAT Cascade row was previously a byte-for-byte copy of the Graph Cascade row. That was not a coincidence of similar decision surfaces: `gat_cascade.py` gated its only implementation behind the optional `torch_geometric` package, which is not installed, so the import failed and every prediction silently fell back to `CascadeGNN`. The GAT is now a real multi-head attention network, gradient-trained with PyTorch autograd and exported to a JSON artifact for deterministic NumPy inference. The two models are now genuinely distinct, and the payload records an `independent` flag per graph model plus a `graph_attention` status block so a future alias cannot be presented as corroborating evidence.
-
-The Risk Scorer row is lower than earlier drafts reported because metrics are now computed through the production `XGBoostScorer.score` entry point rather than the legacy boosted-stump model that never served alerts. The numbers describe the model actually in the request path; the earlier 93.85% described a model that was not deployed. Recall of 44.64% means the production scorer misses over half of the positive cases at the 0.5 threshold, which is a real limitation and not a rounding artifact.
-
-High classification accuracy on the synthetic set establishes reproducibility on the training distribution but not external validity. The GAT was trained on a disjoint synthetic seed (17) from its evaluation seed (31), but both come from the same generator, so this is a generalization check within the synthetic distribution only. Independent time-separated splits and real CDM records are required for a publishable operational-accuracy claim.
-
-### F. Practical Effect of Corrections
-
-The repaired pipeline enforces a consistent event chain:
-1. The numerical solver localizes the encounter time and positions via Hermite refinement
-2. The hotspot marker uses the refined TCA position, not the initial epoch
-3. An alert is generated for any miss distance under the 100 m warning gate
-4. Debris is generated only when the collision gate ($d < 1$ m) is crossed
-5. The Cesium layer renders each supplied forecast shell as a distinct translucent ellipsoid
-
-This alignment removes previously visible contradictions in both API payloads and the globe display, where debris could appear for passes hundreds of meters apart and where the incident marker could appear on the opposite side of the Earth from the actual close approach.
-
-The corrections to the learned components have a different character, and their effect is on reporting rather than on physics. Defects 6 and 9 did not change any computation that reached an operator; they changed what the system *claimed* about its computations. Before the correction, a single model was displayed as two corroborating models, a model that never served alerts supplied the reported accuracy figure, and a total ranker failure was displayed as a normal-looking plan. The consequence is that the prototype's headline metrics were not measurements of deployed behavior, and a reader of the earlier artifact would have drawn incorrect conclusions about system redundancy and risk-scorer quality even though no displayed probability was wrong.
-
-Defect 7 is different again. It did not corrupt a result; it prevented any result from being produced on a default deployment, which means that the numerical findings in this paper describe code paths that were unreachable in a stock configuration. The operational snapshot in Section VI.B is reported specifically because it is the evidence that the corrections restored reachability rather than merely internal correctness.
-
----
-
-## VII. Discussion and Limitations
-
-### A. What the Prototype Demonstrates
-
-- An end-to-end path from orbital elements to a live operator display with sub-second refresh, verified reachable under the default configuration
-- Transparent, auditable stages: SGP4 propagation, Foster B-plane Pc, CPI ranking, graph cascade, debris EVOLVE model, Cesium visualization
-- Deterministic injection scenarios enabling repeatable regression testing
-- Clear API contracts between heuristic and model-based components, supporting modular replacement
-- A ranker arrangement in which a silent total failure is structurally impossible to present as a healthy plan
-
-### B. Known Limitations
-
-| Domain | Limitation | Recommended Next Step |
-|--------|-----------|----------------------|
-| Orbit state | TLE/SGP4 accuracy degrades with age and post-maneuver mismatch | Timestamped catalog archive with truth ephemerides |
-| Uncertainty | RTN $\sigma_T$ model is a fixed analytical approximation; no measurement-based covariance | B-plane Pc validation against NASA CARA reference cases |
-| Collision risk | Hard-body radius fixed at 10 m; no object-specific dimensions | Object size catalog integration; per-pair radius |
-| Debris | Isotropic EVOLVE envelope; no atmospheric re-entry trajectory for individual fragments | Full fragment orbital element propagation with drag |
-| ML scorer | Training and evaluation use the same Foster-derived synthetic distribution; production recall is 44.64% | Independent time-separated splits; real CDM labels; retune decision threshold |
-| Graph models | Attention ranker is trained, but both rankers consume one shared feature representation, so cross-checking cannot detect a common upstream feature error | Diverse or independently derived feature sets; real conjunction histories |
-| Scale | Pairwise O($N^2$) screening; KD-tree helps but not benchmarked at catalog scale; GAT segment aggregation uses `np.add.at`, which suits ~10² nodes, not catalog scale | Benchmark over 27,000+ object snapshots with timing; vectorised or sparse aggregation |
-| Model startup | A missing attention artifact triggers synchronous retraining on first import, blocking startup for minutes | Pre-baked artifact in the image; background warm-up; readiness gate |
-| Access control | `ALLOW_UNAUTHENTICATED_COMMANDS` and `ALLOW_SESSION_MINTING` both default to enabled, and a request without a session header is attributed to a shared demo session that is authorized for every agency | Default both to disabled; issue per-agency sessions; reject rather than default unidentified requests |
-| Persistence | Alert, debris and maneuver state live in process memory and reset on restart; no audit trail of operator decisions | Durable store with decision logging |
-
-### C. Threats to Validity
-
-**Metric cache provenance:** The `model_metrics_cache.json` records a single evaluation run on a deterministic synthetic configuration. Reported scores may not generalize to other random seeds, different class balance ratios, or real encounter data.
-
-**Graph model degeneracy (resolved):** The previously identical GNN and GAT scores were not a ceiling effect or limited graph diversity. `gat_cascade.py` gated its only implementation behind the uninstalled `torch_geometric` package, so every prediction fell through to `CascadeGNN` and one model was reported as two. The GAT is now a genuinely distinct trained attention network (95.54% versus 98.76%).
-
-**Graph ranker redundancy (resolved, with a caveat):** `cascade_planner.py` previously assigned a `CascadeGAT` to an attribute named `self.gnn`, and `CascadeGNN` was instantiated only by the metrics evaluator and by tests, so the two rows in Table VI.D were not mutually corroborating. `CascadeGNN` is now instantiated in the planner as an explicit cross-check. Two properties of this arrangement must not be overstated. First, both models consume the same `_build_gnn_inputs` representation, so their agreement is not independent evidence — they are two readouts of one feature space, not two independent measurements. Second, they are deliberately not ensembled: the GAT applies attention and the GNN applies symmetric aggregation, so a weighted average would yield a value corresponding to neither model. The GAT therefore remains the sole ranker, and the GNN's contribution is limited to reporting per-satellite disagreement (observed maximum 0.211 against a 0.25 review threshold on the 120-node operational snapshot) for operator inspection. The residual validity threat is that a shared upstream feature error would not be detected by cross-checking, since it would affect both models identically.
-
-**Fabricated all-zero plans on ranker failure (resolved):** the planner previously caught any ranker exception and substituted zero vectors for manoeuvre probability and cascade depth, then published the resulting plan as healthy. Because the downstream risk update subtracts a probability-proportional term, an all-zero input inflated the apparent post-manoeuvre safety margin and understated residual risk. Ranker failure is now either surfaced as a hard error that preserves the last valid plan, or, where a healthy second model is available, reported as a degraded plan carrying real cross-check probabilities, an explicit `degraded` flag, and a corresponding status indicator in the operator interface.
-
-**Regression test coverage:** The test suite is narrow regression testing of specific corrected behaviours. It does not constitute a comprehensive verification and validation suite.
-
-**No UI study:** Visual correctness was assessed through rendered artifact inspection and code review. No user study of operator comprehension, alert triage performance, or decision latency was conducted.
-
-### D. Recommended Research Path
-
-The next validation phase should:
-1. Build an encounter-plane probability benchmark against NASA CARA reference cases
-2. Integrate object-specific covariances and hard-body radii from a curated catalog
-3. Validate TCA localization against dense high-fidelity (high-order numerical) propagation
-4. Implement temporal train/calibration/test splits for the risk scorer
-5. Replace spherical EVOLVE envelopes with fragment ensembles propagated through drag-sensitive orbital dynamics with re-entry prediction
-
----
-
-## VIII. Conclusion
-
-Orbital Sentinel provides a coherent, explainable prototype for real-time orbital visualization and conjunction response. The Foster B-plane pipeline, RTN covariance model, Hermite TCA refinement, XGBoost risk scorer, graph cascade rankers, and NASA EVOLVE debris model are all documented to their implementation files and mathematically grounded in established space mechanics methods.
-
-The audit identified eleven defects. Five concern the physics and rendering path: miss-independent probability, sample-grid TCA error and target overshoot, initial-epoch hotspot placement, debris on near-misses, and loss of debris forecast layers in the client. Six concern the learned and disseminated results: an attention ranker that silently reported another model's scores, an alert pipeline disabled under the default configuration, ranker failure converted into a fabricated all-zero plan, risk-scorer metrics drawn from a model that never served alerts, alert count and list able to disagree, and TCA urgency measured against wall-clock time. All eleven are corrected, and the behavioral effects are verified by a 116-test regression suite plus an in-process check against a 120-satellite snapshot.
-
-The methodological finding is worth stating separately from the individual fixes. Every defect in the learned-component group shared one shape: the code computed something correct, and the *description* of that computation was wrong. A stub reported as a trained model, a metrics row attributed to a model outside the request path, a silent fallback reported as a healthy plan, and a cross-check presented as independent corroboration are all reporting failures rather than computational ones. They are also the failures a synthetic test suite is least likely to catch, because the numbers being produced are plausible. The defenses adopted in response — artifact-level `independent` and `degenerate` flags, disagreement thresholds surfaced to the operator, and metrics generated through the production entry point rather than a parallel one — are therefore part of the contribution, not incidental instrumentation.
-
-Cached synthetic metrics are useful within their stated scope: 75.46% risk-scorer accuracy on Foster-generated data through the production scoring path, 98.76% graph-cascade accuracy and 95.54% GAT accuracy on synthetic graph snapshots. The correct conclusion is that the prototype offers a reproducible architecture, an aligned event chain from encounter detection through visualization, and a corrected baseline for future validation — not that it possesses operational collision-prediction accuracy. The risk scorer's 44.64% recall is a known weakness that must be addressed before the model is trusted operationally, and it is a property of the deployed model rather than of its reporting. Independent temporal evaluation, real CDM data, and full breakup-model fragment propagation remain necessary before operational deployment.
-
----
-
-## References
-
-[1] European Space Agency, "ESA's Annual Space Environment Report," ESA Space Debris Office, Darmstadt, Germany, 2024.
-
-[2] D. A. Vallado, P. Crawford, R. Hujsak, and T. S. Kelso, "Revisiting Spacetrack Report #3," in *AIAA/AAS Astrodynamics Specialist Conference*, Keystone, CO, 2006, AIAA 2006-6753.
-
-[3] J. L. Foster and H. S. Estes, "A Parametric Analysis of Orbital Debris Collision Probability and Maneuver Rate for Space Vehicles," NASA/JSC-25898, 1992.
-
-[4] F. K. Chan, "Spacecraft Collision Probability," *Journal of Guidance, Control, and Dynamics*, vol. 20, no. 3, pp. 566–571, 1997.
-
-[5] N. L. Johnson, P. H. Krisko, J.-C. Liou, and P. D. Anz-Meador, "NASA's New Breakup Model of EVOLVE 4.0," *Advances in Space Research*, vol. 28, no. 9, pp. 1377–1384, 2001.
-
-[6] K. T. Alfriend, M. R. Akella, J. Frisbee, J. L. Foster, D. J. Lee, and M. Wilkins, "Probability of Collision Error Analysis," *Space Debris*, vol. 1, no. 1, pp. 21–35, 1999.
-
-[7] M. R. Akella and K. T. Alfriend, "Probability of Collision Between Space Objects," *Journal of Guidance, Control, and Dynamics*, vol. 23, no. 5, pp. 769–772, 2000.
-
-[8] R. H. Battin, *An Introduction to the Mathematics and Methods of Astrodynamics*, revised ed. AIAA Education Series, 1999.
-
-[9] Orbital Sentinel repository: `README.md`, `PROJECT_SCENARIO.md`, `analytics.py`, `conjunction.py`, `debris_model.py`, `xgboost_scorer.py`, `gnn_cascade.py`, `gat_cascade.py`, `cascade_planner.py`, `sgp4_propagator.py`. Accessed September 2026.
-
-[10] Orbital Sentinel `model_metrics_cache.json`, synthetic evaluation artifact, generated 25 September 2026.
-
----
-
-*Manuscript prepared September 2026. All analysis derives from the supplied repository and installed runtime capabilities. No external dependency was downloaded for evidence generation.*
+# Orbital Sentinel: An Open, Cross-Checked Pipeline for Satellite Conjunction Assessment with Cascade-Aware Maneuver Planning
+
+**Authors:** Soumyadeep Dey, Pritam Patra, Subarna Maity, Sourish Panda  
+**Affiliation:** Guru Nanak Institute of Technology, Howrah, West Bengal, India
+
+> Markdown mirror of `orbital_sentinel_paper.tex`, the IEEE submission source. Figures are rendered only in the PDF.
+
+# Abstract
+
+As the tracked catalog grows, satellite operators must screen more object pairs and justify each maneuver decision. This paper presents Orbital Sentinel, an open-source pipeline that screens a two-line element (TLE) catalog for close approaches over a 24-h horizon, computes the Foster two-dimensional probability of collision using per-object hard-body radii and a covariance that grows with TLE age, and streams the results to a three-dimensional web globe. Every probability is cross-checked against the Chan series and the Alfano maximum-probability bound, and the highest-risk alerts are also checked by Monte Carlo sampling. Candidate avoidance burns are verified by re-propagation, and the best candidates are re-screened against the whole catalog and simulated debris, so a burn that creates a secondary conjunction is rejected. Collision consequences are modeled with the NASA Standard Breakup Model and fragment propagation under J2 and drag. An XGBoost surrogate of the logarithmic probability, explained with TreeSHAP, never changes the published probability and can only escalate, never lower, the physics-based action. On 12 000 held-out synthetic encounters it attains a mean absolute error of 0.106 decades, with 0.975 precision and 0.950 recall at the $`10^{-4}`$ maneuver threshold, whereas a miss-distance-only baseline detects no high-risk encounter. Screening 500 objects takes about 1 s on a laptop processor, and all 18 analytical physics checks and 204 regression tests pass.
+
+**Index Terms**: collision avoidance, collision probability, conjunction assessment, explainable machine learning, orbital debris, space situational awareness, SGP4, XGBoost
+
+# Introduction
+
+According to the European Space Agency (ESA), about 1.5 million objects between 1 and 10 cm are in orbit, and about 47 000 objects are regularly tracked and cataloged \[1\]\[2\]. The 2009 collision between Iridium 33 and Cosmos 2251 created thousands of trackable fragments \[3\], and collisions are expected to dominate future debris growth through the cascade described by Kessler and Cour-Palais \[4\]\[5\].
+
+Operational conjunction assessment (CA) relies on precise orbit data, the two-dimensional probability of collision ($`P_c`$), and expert review \[6\]. Open tools for education, prototyping, and research rarely expose the complete chain from screening to probability to maneuver decision. Two gaps are common. First, operational practice screens a planned maneuver against the full catalog before execution \[6\], but open research tools rarely implement this step and often check a burn only against the primary threat, so a burn that resolves one conjunction can create another. Second, machine-learning (ML) components are increasingly proposed for CA \[7\]\[8\]\[9\], but their outputs are rarely explained or prevented from lowering physically derived risk.
+
+This paper presents Orbital Sentinel, an open-source system that addresses both gaps. Its contributions are:
+
+1.  a 24-h future-window screening pipeline that combines a spatial-index candidate search, a linear relative-motion filter, and Brent refinement of the time of closest approach (TCA);
+
+2.  a Foster $`P_c`$ engine with a TLE-age covariance model and per-object hard-body radius (HBR), cross-checked on every alert by the Chan series and the Alfano bound and, for the highest-risk alerts, by Monte Carlo sampling;
+
+3.  a cascade-aware maneuver planner that re-propagates every candidate burn and re-screens the best candidates against the full catalog and simulated fragments;
+
+4.  an explainable XGBoost $`P_c`$ surrogate whose held-out accuracy, baselines, and per-alert TreeSHAP attributions are reported, and which can raise but never lower the physics-based action; and
+
+5.  a reproducible evaluation, including negative results that justify keeping weaker learned components out of the decision path.
+
+Our evaluation is internal: it checks consistency against analytical solutions, independent numerical references, and synthetic data, not operational skill.
+
+# Related Work
+
+*Orbit propagation and screening.* Public TLEs are propagated with the Simplified General Perturbations 4 (SGP4) model \[10\], whose reference implementation was revised by Vallado *et al.* \[11\]. SGP4 accuracy degrades with element age \[12\]\[13\]. Classical screening first removes pairs whose apogee/perigee shells cannot overlap \[14\].
+
+*Collision probability.* For short encounters with linear relative motion, $`P_c`$ reduces to a two-dimensional Gaussian integral over the hard-body disk in the encounter plane, introduced by Foster and Estes \[15\]. Equivalent formulations include the Chan series \[16\] and the contour integral of Patera \[17\]. Akella and Alfriend \[18\] formalized the short-encounter assumptions, and Alfriend *et al.* \[19\] showed how strongly $`P_c`$ depends on covariance error. NASA’s Conjunction Assessment Risk Analysis (CARA) program has documented the usage boundaries of the two-dimensional method \[20\], Monte Carlo verification \[21\], and operational practice, including the $`10^{-4}`$ maneuver threshold \[6\]. Open implementations cover parts of this chain: CARA publishes its probability tools as open source \[22\], and the SOCRATES service publishes TLE-based conjunction screening reports \[23\]. To our knowledge, none couples screening, probability, breakup, and catalog-wide maneuver re-screening in one open pipeline.
+
+*Machine learning for CA.* The ESA Collision Avoidance Challenge trained models to forecast the final risk in a sequence of conjunction data messages (CDMs) \[7\]. Other work combined ML with evidence theory \[8\], benchmarked deep networks for all-vs-all screening \[9\], and corrected orbit-prediction error \[24\]. These studies rarely report feature attributions or limit a model’s authority over the physical estimate. We use the exact tree form of Shapley additive explanations, TreeSHAP \[25\], with gradient-boosted trees \[26\], and keep the physical $`P_c`$ authoritative.
+
+*Debris and cascades.* The NASA Standard Breakup Model (SBM) \[27\] is the standard tool for generating fragment populations. Graph neural networks \[28\] suggest learned formulations of cascade risk; we use a physics-first graph and evaluate learned graph rankers only as advisory cross-checks.
+
+# System Architecture
+
+Fig. <a href="#fig:pipeline" data-reference-type="ref" data-reference="fig:pipeline">1</a> shows the pipeline. A Python backend (FastAPI) propagates the catalog, refreshes alerts every 30 s and after every state change, and serves a representational state transfer (REST) application programming interface (API) together with a WebSocket stream that pushes positions at 1 Hz. A React client renders objects, encounter hotspots, and debris on a CesiumJS globe, converting inertial coordinates to Earth-fixed ones with Greenwich mean sidereal time \[11\]. TLEs come from Space-Track when credentials are configured, then from a public mirror, and otherwise from a bundled 31 068-object snapshot. All physics runs on a simulation clock, defined as wall-clock time plus an operator offset of up to $`\pm24`$ h, so scenarios are repeatable. Every assumed input, such as an object’s mass or radius, is a named constant, and each output records which assumption it used.
+
+<figure id="fig:pipeline" data-latex-placement="!t">
+<p><em>[Figure rendered in the PDF version]</em></p>
+<figcaption>Orbital Sentinel pipeline. Solid boxes produce authoritative quantities. Dashed boxes are verification or learned outputs that never modify the physical <span class="math inline"><em>P</em><sub><em>c</em></sub></span>; the surrogate feeds the decision score and can only escalate the action.</figcaption>
+</figure>
+
+# Methods
+
+## Propagation and Executed Burns
+
+States are propagated with SGP4, using World Geodetic System 1972 (WGS-72) constants in the true-equator mean-equinox frame \[10\]\[11\]. Refitting a TLE after a maneuver would introduce fitting error, so an executed impulse $`\Delta\mathbf{v}`$ is applied as a deviation computed with a two-body plus Earth-oblateness ($`J_2`$) integrator (fourth-order Runge–Kutta):
+``` math
+\begin{equation}
+  \mathbf{r}(t) = \mathbf{r}_{\mathrm{SGP4}}(t)
+  + \left[\mathbf{r}_{J_2}\big(t;\mathbf{x}_0+[\mathbf{0};\Delta\mathbf{v}]\big)
+          - \mathbf{r}_{J_2}(t;\mathbf{x}_0)\right],
+\label{eq:burn}
+\end{equation}
+```
+where $`\mathbf{x}_0`$ is the position–velocity state at burn time. A zero burn therefore leaves the trajectory unchanged, and the planner and the executed burn share one model.
+
+## Future-Window Screening
+
+All objects are propagated on a 60-s grid over 24 h. An apogee/perigee shell filter removes objects whose radial range cannot overlap any other object \[14\]. At each step $`t_k`$, candidate pairs are found with a $`k`$-dimensional tree (KD-tree) \[29\] using the search radius
+``` math
+\begin{equation}
+  \rho = d_{\mathrm{th}} + \tfrac{1}{2}\,v_{\mathrm{max}}\,\Delta t,
+\end{equation}
+```
+with threshold $`d_{\mathrm{th}}=25`$ km, step $`\Delta t=60`$ s, and $`v_{\mathrm{max}}`$ equal to twice the largest orbital speed in the window. Each candidate is passed through a linear relative-motion filter. With relative position $`\mathbf{r}_{\mathrm{r}}`$ and relative velocity $`\mathbf{v}_{\mathrm{r}}`$, the local closest-approach time is
+``` math
+\begin{equation}
+  t^{*} = -\frac{\mathbf{r}_{\mathrm{r}}\cdot\mathbf{v}_{\mathrm{r}}}{\left\|\mathbf{v}_{\mathrm{r}}\right\|^{2}},
+\end{equation}
+```
+and the candidate is kept if $`|t^{*}|\le\Delta t/2`$ and $`\left\|\mathbf{r}_{\mathrm{r}}+\mathbf{v}_{\mathrm{r}}\,t^{*}\right\|\le d_{\mathrm{th}}+5`$ km. Slow co-orbital pairs ($`\left\|\mathbf{v}_{\mathrm{r}}\right\|<0.05`$ km/s) skip the $`t^{*}`$ test, and at most three candidate steps per pair are refined, smallest linearized miss first. The TCA is refined by bounded Brent minimization \[30\]\[31\] of the exact SGP4 distance on $`[t_k-\Delta t,\,t_k+\Delta t]`$ with 1-ms tolerance, and the closest encounter per pair within $`d_{\mathrm{th}}`$ becomes an alert.
+
+## Covariance Model and Foster Probability
+
+TLEs carry no covariance, so a per-object covariance is modeled in the radial, transverse, and normal (RTN) frame. Its 1$`\sigma`$ values grow linearly with the propagation span $`\tau`$ (days) from the TLE epoch to the TCA:
+``` math
+\begin{equation}
+\begin{aligned}
+  \boldsymbol{\sigma}(\tau) &= \boldsymbol{\sigma}_0 + \mathbf{g}\,\tau,\qquad
+  \boldsymbol{\sigma}_0=(0.10,\,0.50,\,0.15)~\text{km},\\
+  \mathbf{g} &= (0.10,\,1.00,\,0.10)~\text{km/day}.
+\end{aligned}
+\label{eq:cov}
+\end{equation}
+```
+This is a single, regime-independent simplification chosen to match the order of magnitude of low-Earth-orbit TLE errors \[12\]\[13\]; actual errors vary with orbit regime and drag, so absolute $`P_c`$ values are indicative. Each covariance is rotated to the inertial frame, $`\mathbf{C}=\mathbf{R}\,\mathrm{diag}(\boldsymbol{\sigma}^2)\mathbf{R}^{T}`$, and the two are summed. The encounter plane is normal to $`\mathbf{v}_{\mathrm{r}}`$. With unit vectors $`\hat{\mathbf{h}}=\mathbf{v}_{\mathrm{r}}/\left\|\mathbf{v}_{\mathrm{r}}\right\|`$, $`\hat{\mathbf{t}}\propto\hat{\mathbf{h}}\times\mathbf{r}_1`$, and $`\hat{\mathbf{n}}=\hat{\mathbf{t}}\times\hat{\mathbf{h}}`$, the projection $`\mathbf{B}=[\hat{\mathbf{t}}\;\hat{\mathbf{n}}]^{T}`$ gives the miss vector $`\mathbf{b}=\mathbf{B}\mathbf{r}_{\mathrm{r}}`$ and the encounter covariance $`\mathbf{C}_B=\mathbf{B}(\mathbf{C}_1+\mathbf{C}_2)\mathbf{B}^{T}`$. Foster’s probability \[15\] is
+``` math
+\begin{equation}
+  P_c=\frac{1}{2\pi\sqrt{|\mathbf{C}_B|}}\iint_{\left\|\mathbf{x}\right\|\le R_{\mathrm{HB}}}
+  e^{-\frac{1}{2}(\mathbf{x}-\mathbf{b})^{T}\mathbf{C}_B^{-1}(\mathbf{x}-\mathbf{b})}
+  \,d\mathbf{x}.
+\label{eq:foster}
+\end{equation}
+```
+It is evaluated in polar coordinates with 48-point Gauss–Legendre quadrature in radius and a 96-point trapezoid rule in angle. The combined radius $`R_{\mathrm{HB}}`$ is the sum of the objects’ radii. Each radius is taken from the radar cross-section class in the public satellite catalog (SATCAT): 0.18 m for small and 0.56 m for medium objects. Otherwise it defaults by object type: 5 m for payloads, 4 m for rocket bodies, 0.5 m for debris, and 1 m for unknown objects. Named large structures have their own values, for example 55 m for the International Space Station. An alert is flagged when the short-encounter assumption is questionable ($`\left\|\mathbf{v}_{\mathrm{r}}\right\|<0.1`$ km/s) \[18\]\[20\].
+
+## Independent Probability Cross-Checks
+
+Each alert also carries independent estimates computed from its published encounter-plane fields (miss vector, $`3\sigma`$ ellipse, and HBR). The first is the Chan equivalent-area series \[16\]. With $`(x,y)`$ the miss components in the covariance principal axes, $`u=R_{\mathrm{HB}}^{2}/(\sigma_x\sigma_y)`$, and $`v=x^{2}/\sigma_x^{2}+y^{2}/\sigma_y^{2}`$,
+``` math
+\begin{equation}
+  P_c^{\mathrm{Chan}}=e^{-v/2}\sum_{m=0}^{\infty}\frac{(v/2)^m}{m!}
+  \Big[1-e^{-u/2}\sum_{k=0}^{m}\frac{(u/2)^k}{k!}\Big],
+\label{eq:chan}
+\end{equation}
+```
+which is evaluated in log space and is exact for an isotropic covariance \[16\]. The second is the Alfano maximum probability over covariance scaling \[32\]. Its closed form, $`R_{\mathrm{HB}}^{2}/(e\,\sigma_x\sigma_y\,\mathbf{b}^{T}\mathbf{C}_B^{-1}\mathbf{b})`$, is refined numerically and bounds $`P_c`$ when the covariance size is uncertain. Both are computed for every alert. The third, applied to the ten highest-$`P_c`$ alerts of each refresh, is seeded Monte Carlo sampling \[21\] with up to $`2\times10^{5}`$ draws; it reports no value when fewer than ten hits occur, rather than a noisy estimate. The spread of $`\log_{10}P_c`$ across methods is published with each alert, together with a flag that is set when Foster and Chan agree within 0.5 decades (one decade is a factor of 10 in $`P_c`$).
+
+## Breakup Model and Fragment Screening
+
+When a collision is simulated, both objects are propagated to the predicted TCA and the NASA SBM \[27\] is applied. With projectile (smaller) mass $`m_p`$, target mass $`M_t`$, and impact speed $`v`$, the collision is catastrophic if $`\tfrac{1}{2}m_p v^{2}/M_t\ge 40`$ J/g. The reference mass is $`M=m_1+m_2`$ for a catastrophic collision and $`M=m_p v^{2}`$ ($`v`$ in km/s) otherwise. The number of fragments of characteristic length $`L_c`$ between 10 cm and $`L_{\max}=(m_{\max}/\rho_b)^{1/3}`$, with $`m_{\max}`$ the larger parent mass and bulk density $`\rho_b=100`$ kg/m$`^3`$, is
+``` math
+\begin{equation}
+  N=0.1\,M^{0.75}\left(L_{\min}^{-1.71}-L_{\max}^{-1.71}\right),\quad
+  L_{\min}=0.1~\text{m}.
+\label{eq:sbm}
+\end{equation}
+```
+The area-to-mass exponent $`\chi=\log_{10}(A/M)`$ is drawn from the bimodal SBM distributions, and the ejection speed follows $`\log_{10}\Delta v\sim\mathcal{N}(0.9\chi+2.9,\,0.4)`$ in isotropic directions. Momentum is re-centered for each parent body. Up to 1 000 weighted fragments are propagated with two-body, $`J_2`$, and drag dynamics (drag coefficient 2.2, exponential atmosphere \[11\]). Each fragment is screened against the catalog over 6 h on a 30-s grid with a 5-km threshold, using an isotropic encounter-plane covariance (satellite 0.2 km; fragment 0.1 km growing at 1 m/s) instead of <a href="#eq:cov" data-reference-type="eqref" data-reference="eq:cov">[eq:cov]</a>.
+
+## Cascade Graph
+
+Alerts form an undirected graph whose nodes are objects and simulated collision events. Each event is linked to its two parent objects and its fragments, and each alert links its two objects. Cascade depth is the number of breadth-first-search (BFS) hops from the nearest event; an alert not connected to any event has depth 1. Assuming independent encounters, a node’s hit probability is $`P_{\mathrm{hit}}=1-\prod_i(1-P_{c,i})`$ over its incident alerts.
+
+## Cascade-Aware Maneuver Planning
+
+For up to 15 alerts with $`P_c\ge10^{-6}`$, the planner evaluates impulsive burns in the positive and negative radial, along-track, and cross-track directions, with eight magnitudes from 0.01 to 2 m/s. Every candidate is applied with <a href="#eq:burn" data-reference-type="eqref" data-reference="eq:burn">[eq:burn]</a>, the encounter with the threat is re-screened within $`\pm15`$ min, and $`P_c`$ is recomputed with <a href="#eq:foster" data-reference-type="eqref" data-reference="eq:foster">[eq:foster]</a>. The target is $`P_c<10^{-6}`$. Up to four shortlisted options are then re-screened for 24 h against the whole catalog and up to 2 000 live fragments within a 2.5-s budget; options left unchecked are flagged. Secondary encounters that also appear in a zero-burn pass are discounted, so only conjunctions that the burn creates or worsens are counted. An option is *cascade-safe* if it induces no secondary conjunction with $`P_c\ge10^{-6}`$ or a miss distance below 1 km. The planner selects the smallest cascade-safe $`\Delta v`$ that reaches the target; otherwise the cascade-safe option with the largest $`P_c`$ reduction; otherwise it reports that no cascade-safe option exists. Propellant is costed with the rocket equation, $`m_{\mathrm{prop}}=m_0\big(1-e^{-\Delta v/(I_{sp}g_0)}\big)`$, for a catalog of 12 chemical, cold-gas, and electric thrusters. A burn is flagged as non-impulsive when its duration exceeds 10% of the lead time to TCA or one tenth of an orbit. As an analytic check, the along-track shift predicted by the Clohessy–Wiltshire equations \[33\] is compared with the numerically propagated shift.
+
+## Explainable Probability Surrogate
+
+The surrogate is an XGBoost regressor \[26\] of $`\log_{10}P_c`$ (floored at $`10^{-12}`$) with seven inputs: miss distance, radial miss, relative speed, the larger and smaller TLE ages, HBR, and altitude. It does not see the covariance or the encounter-plane geometry. Labels are computed with <a href="#eq:cov" data-reference-type="eqref" data-reference="eq:cov">[eq:cov]</a> and <a href="#eq:foster" data-reference-type="eqref" data-reference="eq:foster">[eq:foster]</a> on 60 000 sampled encounters (seed 20261008), with altitude uniform in 300–2000 km, crossing angles of 0.5–175$`^\circ`$, miss distances log-uniform from 3 m to 25 km, per-object TLE ages log-uniform from 0.5 h to 1 year, and combined HBR log-uniform from 3 to 50 m. Before training, the radial miss is removed from 30% of rows, the altitude from 30%, and both TLE ages from 15%, so that the model tolerates missing inputs. The data are split 70/10/20 into training, early-stopping validation, and held-out test sets. Training uses squared error, a learning rate of 0.08, and depth 8, and early stopping retains 88 rounds.
+
+Because the Foster $`P_c`$ is computed for every alert, the surrogate is not used for speed. Its role is to provide additive per-alert attributions whose sum with a base value equals the prediction: exact TreeSHAP \[25\] for the eight highest-risk alerts per refresh, and the cheaper Saabas path attribution \[25\] for the rest. These attributions explain the surrogate, not the physical computation. The surrogate never writes the published $`P_c`$, and its disagreement with physics, $`|\Delta\log_{10}P_c|`$, is reported as a diagnostic.
+
+## Decision Score
+
+For ranking and display, the models are combined in a bounded score whose weights are design choices, not fitted or validated. With $`L(p)=\mathrm{clip}\big((\log_{10}p+7)/3,\,0,\,1\big)`$,
+``` math
+\begin{equation}
+\begin{aligned}
+  S = 100\,\big[\,&0.60\,L(P_c)+0.15\,L(\hat P_c)\\
+  &+0.15\,(1-e^{-D/5})+0.10\,\kappa\,e^{-\Delta v/v_0}\,\big],
+\end{aligned}
+\label{eq:score}
+\end{equation}
+```
+where $`\hat P_c`$ is the surrogate output, $`D`$ the number of downstream objects, $`v_0=1`$ m/s, and $`\kappa\in\{1,0.5,0\}`$ for a cascade-safe plan, an unsafe plan, and no plan. The physics term outweighs all other terms combined. The action is set by the physical $`P_c`$: maneuver at $`P_c\ge10^{-4}`$ \[6\], and prepare and monitor at $`10^{-5}`$ and $`10^{-7}`$, our own planning tiers. A prepare action is escalated to maneuver only when the surrogate predicts $`\hat P_c\ge10^{-4}`$ and the cascade term is at least 0.5 ($`D\ge4`$). This is the only way a learned output affects the action, and no model can lower the physics action.
+
+# Evaluation Setup
+
+Experiments ran on a laptop with an Intel Core i3-1215U processor and 16 GB of memory, using Python 3.14, NumPy 2.5, SciPy 1.18 \[31\], XGBoost 3.4, and sgp4 2.27. Probability accuracy is measured against the exact noncentral chi-square (Rice) distribution, which is the closed-form solution for an isotropic covariance \[16\]. Physics consistency is assessed with 18 analytical checks. Screening throughput is measured on the first 500 objects of the bundled catalog (the default size of the live server) at a simulation epoch of 2026-05-12 00:00 UTC; these are the first entries in catalog order, not a regime-stratified sample. Surrogate accuracy is measured on the 12 000 held-out encounters against a constant predictor and a miss-distance-only XGBoost baseline. Behavior is protected by a 204-test regression suite (20 files, under 30 s), which passes in full. Several tests compute their expected values independently, for example by brute-force screening on a 1-s grid refined at 1-ms resolution, which screening matches within 1 s in TCA and 0.1 km in miss distance.
+
+# Results
+
+## Probability Accuracy
+
+Fig. <a href="#fig:pc" data-reference-type="ref" data-reference="fig:pc">2</a> uses $`\sigma=10`$ m per axis and $`R_{\mathrm{HB}}=10`$ m. The quadrature implementation of <a href="#eq:foster" data-reference-type="eqref" data-reference="eq:foster">[eq:foster]</a> matches the exact solution to at least six significant digits from $`3.9\times10^{-1}`$ down to $`3.4\times10^{-20}`$, and the Chan series <a href="#eq:chan" data-reference-type="eqref" data-reference="eq:chan">[eq:chan]</a> is exact here, as expected. SciPy’s adaptive `dblquad` integrator, used as a reference, drifts by up to $`3.3\times10^{-4}`$ relative error in the far tail. A single-term small-body approximation, to which earlier versions of the system fell back when `dblquad` failed or exceeded its 2-s timeout, underestimates $`P_c`$ by 23% at zero miss distance and overestimates it by factors of 2.4 at 50 m and 4.8 at 100 m. It has therefore been replaced everywhere, including that fallback, by the full series <a href="#eq:chan" data-reference-type="eqref" data-reference="eq:chan">[eq:chan]</a>.
+
+<figure id="fig:pc" data-latex-placement="!t">
+<p><em>[Figure rendered in the PDF version]</em></p>
+<figcaption>Collision probability versus miss distance for <span class="math inline"><em>σ</em> = 10</span> m per axis and <span class="math inline"><em>R</em><sub>HB</sub> = 10</span> m. The Foster quadrature coincides with the exact solution over 19 decades.</figcaption>
+</figure>
+
+## Physics Validation
+
+All 18 analytical checks pass in under 0.7 s. Foster agrees with the Rice solution to $`2.3\times10^{-16}`$ and with Chan to $`4.6\times10^{-16}`$ (isotropic) and $`\le1.3\times10^{-3}`$ (5:1 and rotated 3.3:1 covariances), relative. Monte Carlo ($`2\times10^{5}`$ draws) agrees within four standard errors on all three geometries, and the Alfano bound ($`2.60\times10^{-3}`$) exceeds Foster ($`2.30\times10^{-3}`$), as required. The $`J_2`$ Runge–Kutta integrator drifts in energy by $`6.7\times10^{-11}`$ over 3 h and stays within 0.040 km of SGP4 over 30 min. The Clohessy–Wiltshire, Hohmann, and rocket-equation checks agree with numerical results to $`2.3\times10^{-3}`$, $`1.6\times10^{-7}`$, and $`1.4\times10^{-9}`$, and the SBM produces 778 fragments where <a href="#eq:sbm" data-reference-type="eqref" data-reference="eq:sbm">[eq:sbm]</a> predicts 777.6 (800 + 15 kg at 10 km/s).
+
+## Screening Throughput
+
+Table <a href="#tab:screen" data-reference-type="ref" data-reference="tab:screen">[tab:screen]</a> shows the screening funnel for 500 objects. The KD-tree search returns 153 144 candidate pair-steps out of about $`1.8\times10^{8}`$ (124 750 pairs at each of 1 441 epochs). The linear filter keeps 314 pair-steps. After the cap of three refinements per pair, 274 Brent refinements are run over 240 distinct pairs; 189 of them, covering 165 distinct pairs, end within 25 km, giving 165 alerts. The funnel is identical across runs, and end-to-end screening took 0.86–1.00 s over four runs, well inside the 30-s refresh interval.
+
+Because the bundled TLEs are old at this epoch (median span of the older TLE at TCA 6.3 days, maximum 25.6 days), the modeled covariance is large and the maximum $`P_c`$ is $`7.6\times10^{-8}`$. Seven alerts are rated WARNING because their miss distance is below 5 km, and 158 are rated WATCH. No alert reaches even the $`10^{-7}`$ monitor tier, so every decision action is NONE and the maneuver planner was not triggered in this run; its evaluation rests on the constructed encounters in Section <a href="#sec:maneuver" data-reference-type="ref" data-reference="sec:maneuver">6.4</a>. Operational use would require recent TLEs.
+
+<div class="tabular">
+
+@lrr@ Stage & Output & Time (s)\
+SGP4 propagation on 60-s grid & 500 objects & 0.198\
+KD-tree candidate search & 153 144 pair-steps & 0.432\
+Linear relative-motion filter & 314 pair-steps & –\
+Brent TCA refinement ($`\le`$<!-- -->3 per pair) & 274 runs & 0.073\
+Foster $`P_c`$ and alert assembly & 165 alerts & 0.247\
+Total (representative run) & & 0.950\
+
+</div>
+
+## Maneuver Verification
+
+Regression tests exercise the planner on constructed encounters. In one test, the naive minimum-$`\Delta v`$ burn, executed on a clone of the satellite, brings the maneuvering satellite within 30 m of a third payload, which full screening confirms. The planner marks that option as not cascade-safe, matches the secondary miss distance to within 50 m, and selects a different burn that still reaches $`P_c<10^{-6}`$. In a separate test, the planner’s predicted post-burn miss distance equals the executed result to within 10 m and its predicted TCA to within 1 s. The two-body Clohessy–Wiltshire along-track drift agrees with numerical propagation to within 0.5% (or 2 m) for burns of up to 0.05 m/s over 2 h, and the rocket-equation propellant mass agrees with Runge–Kutta integration of the mass flow to within $`10^{-6}`$ relative error.
+
+## Surrogate Accuracy and Explanations
+
+Table <a href="#tab:ml" data-reference-type="ref" data-reference="tab:ml">[tab:ml]</a> reports held-out results; F1 is the harmonic mean of precision and recall. The surrogate’s mean absolute error (MAE) of 0.106 decades is 15 times lower than that of the miss-distance-only baseline. That baseline is deliberately weak: it never predicts $`P_c\ge10^{-4}`$, which shows that miss distance alone cannot rank risk when the covariance depends on TLE age. At the $`10^{-6}`$ tier the surrogate reaches 0.986 precision and 0.979 recall. Removing the radial miss, or masking features as happens in the live pipeline, raises the error but keeps F1 above 0.88. Projecting the inputs onto principal components hurts accuracy, because the features are weakly redundant (six of seven components are needed for 95% of the variance) and trees split along one axis at a time. The mean absolute TreeSHAP contributions show that the larger TLE age dominates (1.00 decades), because it drives the along-track covariance. It is followed by miss distance (0.78), HBR (0.57), radial miss (0.29), and relative speed (0.15), which is consistent with <a href="#eq:cov" data-reference-type="eqref" data-reference="eq:cov">[eq:cov]</a> and <a href="#eq:foster" data-reference-type="eqref" data-reference="eq:foster">[eq:foster]</a>.
+
+<div class="tabular">
+
+@lccccc@ Model & MAE & RMSE & Prec. & Rec. & F1\
+XGBoost, 7 features & **0.106** & **0.241** & **0.975** & **0.950** & **0.962**\
+without radial miss & 0.224 & 0.634 & 0.971 & 0.924 & 0.947\
+masked features & 0.337 & 0.756 & 0.965 & 0.811 & 0.881\
+first 6 principal comp. & 0.250 & – & – & – & 0.910\
+Miss-only XGBoost & 1.565 & 1.879 & 0 & 0 & 0\
+Constant predictor & 1.739 & 2.277 & – & – & –\
+\
+
+</div>
+
+## Negative Results
+
+Two learned components were evaluated and excluded from the decision path. A 12-unit ungated Elman recurrent network \[34\] for trajectory prediction reaches a position MAE of 459 km on 512 test sequences. That is worse than both persistence (347 km) and linear extrapolation (20.5 km), so it is labeled experimental and feeds no alert. Two graph rankers, a summary-statistics network and a four-head graph attention network \[28\], reach 98.8% and 95.5% accuracy on synthetic graphs, but their labels come from a heuristic, which makes those scores circular. On the 500-object benchmark graph, the attention ranker’s Spearman correlation with the physics $`P_{\mathrm{hit}}`$ is only 0.14, and the two rankers disagree with each other by up to 0.38 in probability. They are therefore shown only as an advisory cross-check and never set depth, probability, or the maneuver plan.
+
+# Discussion and Limitations
+
+The design keeps the physical $`P_c`$ separate from learned estimates, and the negative results show why baselines matter: without them, the recurrent network and the two graph models would have appeared useful. The system has important limitations. The covariance is modeled from TLE age rather than taken from CDMs, so absolute $`P_c`$ values are only as good as <a href="#eq:cov" data-reference-type="eqref" data-reference="eq:cov">[eq:cov]</a> \[19\]\[20\]. Object masses are assumed, because SATCAT provides none, and they set the SBM fragment count through $`M^{0.75}`$. The surrogate is trained on synthetic geometry with combined radii of 3–50 m, whereas live combined radii are often below 3 m. On the 500-object benchmark its median disagreement with the physics $`P_c`$ is 0.90 decades, mostly for $`P_c<10^{-7}`$, where training labels are floored; its held-out accuracy therefore measures how well it reproduces the physics on the training distribution, not operational skill. The planner checks each alert’s options independently, so two simultaneous burns are not screened against each other, and burns are impulsive. Throughput was measured for 500 objects; candidate counts grow roughly quadratically with catalog size, so a full catalog would require parallelization. Future work includes validation on real CDM sequences \[7\], comparison with the CARA tools \[22\], and multi-burn coordination.
+
+# Conclusion
+
+Orbital Sentinel couples future-window screening, cross-checked Foster collision probability, NASA SBM fragment screening, an alert-based cascade graph, and maneuver planning that rejects burns that create new conjunctions in one open pipeline. Its probability engine matches the exact solution over 19 decades, it screens 500 objects in about one second on a laptop processor, and it passes 18 analytical checks and 204 regression tests. The explainable surrogate reaches 0.106-decade error with 0.95 recall at the maneuver threshold but can never lower the physics action. The source code is available at <https://github.com/Pritam-mb/orbit-sentinal>.
+
+# Author Contributions (CRediT)
+
+**Soumyadeep Dey:** Conceptualization, Methodology, Software, Validation, Formal analysis, Writing – original draft. **Pritam Patra:** Software, Visualization, Project administration, Writing – original draft, Writing – review & editing. **Subarna Maity:** Software, Visualization. **Sourish Panda:** Investigation, Writing – review & editing.
+
+# Acknowledgment
+
+The authors thank CelesTrak and the U.S. Space Force Space-Track service for publicly available TLE and SATCAT data, and the maintainers of the open-source sgp4, SciPy, XGBoost, PyTorch, and CesiumJS projects.
+
+# References
+
+1.  ESA Space Debris Office, “ESA’s annual space environment report,” ESA ESOC, Darmstadt, Germany, Rep. GEN-DB-LOG-00288-OPS-SD, Iss. 10.1, Sept. 2026. \[Online\]. Available: <https://www.sdo.esoc.esa.int/environment_report/Space_Environment_Report_I10R1_20260908.pdf>
+
+2.  ESA Space Debris Office, “Space environment statistics,” DISCOSweb, ESA ESOC. Accessed: Oct. 12, 2026. \[Online\]. Available: <https://sdup.esoc.esa.int/discosweb/statistics/>
+
+3.  T. S. Kelso, “Analysis of the Iridium 33–Cosmos 2251 collision,” in *Proc. AAS/AIAA Astrodyn. Specialist Conf.*, Pittsburgh, PA, USA, Aug. 2009, Paper AAS 09-368.
+
+4.  D. J. Kessler and B. G. Cour-Palais, “Collision frequency of artificial satellites: The creation of a debris belt,” *J. Geophys. Res.*, vol. 83, no. A6, pp. 2637–2646, June 1978, doi: 10.1029/JA083iA06p02637.
+
+5.  J.-C. Liou and N. L. Johnson, “Risks in space from orbiting debris,” *Science*, vol. 311, no. 5759, pp. 340–341, Jan. 2006, doi: 10.1126/science.1121337.
+
+6.  NASA, “NASA spacecraft conjunction assessment and collision avoidance best practices handbook,” NASA, Washington, DC, USA, NASA/SP-20205011318, Dec. 2020. \[Online\]. Available: <https://ntrs.nasa.gov/citations/20205011318>
+
+7.  T. Uriot *et al.*, “Spacecraft collision avoidance challenge: Design and results of a machine learning competition,” *Astrodynamics*, vol. 6, no. 2, pp. 121–140, June 2022, doi: 10.1007/s42064-021-0101-5.
+
+8.  L. Sánchez Fernández-Mellado and M. Vasile, “On the use of machine learning and evidence theory to improve collision risk management,” *Acta Astronaut.*, vol. 181, pp. 694–706, Apr. 2021, doi: 10.1016/j.actaastro.2020.08.004.
+
+9.  E. Stevenson, V. Rodriguez-Fernandez, H. Urrutxua, and D. Camacho, “Benchmarking deep learning approaches for all-vs-all conjunction screening,” *Adv. Space Res.*, vol. 72, no. 7, pp. 2660–2675, Oct. 2023, doi: 10.1016/j.asr.2023.01.036.
+
+10. F. R. Hoots and R. L. Roehrich, “Models for propagation of NORAD element sets,” Aerospace Defense Command, U.S. Air Force, Peterson AFB, CO, USA, Spacetrack Rep. No. 3, Dec. 1980. \[Online\]. Available: <https://celestrak.org/NORAD/documentation/spacetrk.pdf>
+
+11. D. A. Vallado, P. Crawford, R. Hujsak, and T. S. Kelso, “Revisiting Spacetrack Report \#3,” in *Proc. AIAA/AAS Astrodyn. Specialist Conf. Exhib.*, Keystone, CO, USA, Aug. 2006, Paper AIAA 2006-6753, doi: 10.2514/6.2006-6753.
+
+12. T. Flohrer, H. Krag, and H. Klinkrad, “Assessment and categorization of TLE orbit errors for the US SSN catalogue,” in *Proc. Adv. Maui Opt. Space Surveill. Technol. Conf. (AMOS)*, Maui, HI, USA, Sept. 2008, pp. 513–524.
+
+13. D. A. Vallado and P. J. Cefola, “Two-line element sets—Practice and use,” in *Proc. 63rd Int. Astronaut. Congr. (IAC)*, Naples, Italy, Oct. 2012, pp. 5812–5825.
+
+14. F. R. Hoots, L. L. Crawford, and R. L. Roehrich, “An analytic method to determine future close approaches between satellites,” *Celest. Mech.*, vol. 33, no. 2, pp. 143–158, 1984.
+
+15. J. L. Foster and H. S. Estes, “A parametric analysis of orbital debris collision probability and maneuver rate for space vehicles,” NASA Johnson Space Center, Houston, TX, USA, Tech. Rep. JSC-25898, Aug. 1992.
+
+16. F. K. Chan, *Spacecraft Collision Probability*. El Segundo, CA, USA: Aerospace Press, 2008, doi: 10.2514/4.989186.
+
+17. R. P. Patera, “General method for calculating satellite collision probability,” *J. Guid. Control Dyn.*, vol. 24, no. 4, pp. 716–722, July 2001, doi: 10.2514/2.4771.
+
+18. M. R. Akella and K. T. Alfriend, “Probability of collision between space objects,” *J. Guid. Control Dyn.*, vol. 23, no. 5, pp. 769–772, Sept. 2000, doi: 10.2514/2.4611.
+
+19. K. T. Alfriend, M. R. Akella, J. Frisbee, J. L. Foster, D.-J. Lee, and M. Wilkins, “Probability of collision error analysis,” *Space Debris*, vol. 1, no. 1, pp. 21–35, Mar. 1999, doi: 10.1023/A:1010056509803.
+
+20. D. T. Hall, “Implementation recommendations and usage boundaries for the two-dimensional probability of collision calculation,” in *Proc. AAS/AIAA Astrodyn. Specialist Conf.*, Portland, ME, USA, Aug. 2019, Paper AAS 19-632.
+
+21. D. T. Hall, S. J. Casali, L. C. Johnson, B. B. Skrehart, and L. G. Baars, “High fidelity collision probabilities estimated using brute force Monte Carlo simulations,” in *Proc. AAS/AIAA Astrodyn. Specialist Conf.*, Snowbird, UT, USA, Aug. 2018, Paper AAS 18-244.
+
+22. NASA CARA, “CARA Analysis Tools,” GitHub repository. Accessed: Oct. 12, 2026. \[Online\]. Available: <https://github.com/nasa/CARA_Analysis_Tools>
+
+23. T. S. Kelso and S. Alfano, “Satellite orbital conjunction reports assessing threatening encounters in space (SOCRATES),” in *Proc. SPIE, Modeling, Simulation, and Verification of Space-Based Systems III*, vol. 6221, May 2006.
+
+24. H. Peng and X. Bai, “Machine learning approach to improve satellite orbit prediction accuracy using publicly available data,” *J. Astronaut. Sci.*, vol. 67, no. 2, pp. 762–793, June 2020, doi: 10.1007/s40295-019-00158-3.
+
+25. S. M. Lundberg *et al.*, “From local explanations to global understanding with explainable AI for trees,” *Nat. Mach. Intell.*, vol. 2, no. 1, pp. 56–67, Jan. 2020, doi: 10.1038/s42256-019-0138-9.
+
+26. T. Chen and C. Guestrin, “XGBoost: A scalable tree boosting system,” in *Proc. 22nd ACM SIGKDD Int. Conf. Knowl. Discov. Data Mining*, San Francisco, CA, USA, Aug. 2016, pp. 785–794, doi: 10.1145/2939672.2939785.
+
+27. N. L. Johnson, P. H. Krisko, J.-C. Liou, and P. D. Anz-Meador, “NASA’s new breakup model of EVOLVE 4.0,” *Adv. Space Res.*, vol. 28, no. 9, pp. 1377–1384, 2001, doi: 10.1016/S0273-1177(01)00423-9.
+
+28. P. Veličković, G. Cucurull, A. Casanova, A. Romero, P. Liò, and Y. Bengio, “Graph attention networks,” in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2018. \[Online\]. Available: <https://arxiv.org/abs/1710.10903>
+
+29. J. L. Bentley, “Multidimensional binary search trees used for associative searching,” *Commun. ACM*, vol. 18, no. 9, pp. 509–517, Sept. 1975, doi: 10.1145/361002.361007.
+
+30. R. P. Brent, *Algorithms for Minimization Without Derivatives*. Englewood Cliffs, NJ, USA: Prentice-Hall, 1973.
+
+31. P. Virtanen *et al.*, “SciPy 1.0: Fundamental algorithms for scientific computing in Python,” *Nat. Methods*, vol. 17, no. 3, pp. 261–272, Mar. 2020, doi: 10.1038/s41592-019-0686-2.
+
+32. S. Alfano, “Relating position uncertainty to maximum conjunction probability,” *J. Astronaut. Sci.*, vol. 53, no. 2, pp. 193–205, 2005.
+
+33. W. H. Clohessy and R. S. Wiltshire, “Terminal guidance system for satellite rendezvous,” *J. Aerosp. Sci.*, vol. 27, no. 9, pp. 653–658, Sept. 1960, doi: 10.2514/8.8704.
+
+34. J. L. Elman, “Finding structure in time,” *Cogn. Sci.*, vol. 14, no. 2, pp. 179–211, Mar. 1990, doi: 10.1207/s15516709cog1402_1.

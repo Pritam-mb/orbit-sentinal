@@ -54,9 +54,9 @@ MU_KM3_S2 = sbm.MU_KM3_S2
 RCS_MASS_KG = {"SMALL": 50.0, "MEDIUM": 500.0, "LARGE": 2000.0}
 # Mass by object type when no RCS is known.
 TYPE_MASS_KG = {"PAY": 800.0, "R/B": 1500.0, "DEB": 20.0, "UNK": 500.0}
-# Hard-body radius (m) of a satellite by RCS class / object type.
-RCS_HBR_M = {"SMALL": 0.5, "MEDIUM": 1.5, "LARGE": 4.0}
-TYPE_HBR_M = {"PAY": 2.0, "R/B": 3.0, "DEB": 0.5, "UNK": 2.0}
+# Hard-body radius (m) comes from app.core.screening.object_meta, the same
+# radius model (SATCAT RCS class, named structures, type defaults) that the
+# conjunction screening uses, so a satellite has one HBR in every Pc.
 
 # Pc covariance model for fragment/satellite pairs (isotropic, B-plane).
 SAT_SIGMA_KM = 0.2                 # catalogue satellite position 1-sigma
@@ -104,14 +104,28 @@ def _object_type_from_name(name: str | None) -> str:
     return "UNK"
 
 
+def _screening_hbr(norad_id: int, name: str | None, otype: str) -> tuple[float, str]:
+    """Hard-body radius (m) and its source from the screening radius model."""
+    from app.core.screening import object_meta
+
+    m = object_meta(int(norad_id), name or "", agency="n/a", object_type=otype)
+    return float(m["radius_m"]), str(m["radius_source"])
+
+
 def object_physical_properties(norad_id: int, name: str | None = None) -> dict[str, Any]:
     """Mass / HBR / type for a catalogue object, with provenance."""
     meta = _REGISTERED_OBJECT_META.get(int(norad_id))
     if meta:
+        otype = meta.get("object_type", "PAY")
+        if "hbr_m" in meta:
+            hbr_m, hbr_src = float(meta["hbr_m"]), "scenario_config"
+        else:
+            hbr_m, hbr_src = _screening_hbr(norad_id, name, otype)
         return {
             "mass_kg": float(meta.get("mass_kg", TYPE_MASS_KG["PAY"])),
-            "hbr_m": float(meta.get("hbr_m", TYPE_HBR_M["PAY"])),
-            "object_type": meta.get("object_type", "PAY"),
+            "hbr_m": hbr_m,
+            "hbr_source": hbr_src,
+            "object_type": otype,
             "mass_source": meta.get("mass_source", "scenario_config"),
         }
     sc = _satcat_lookup(norad_id)
@@ -120,17 +134,20 @@ def object_physical_properties(norad_id: int, name: str | None = None) -> dict[s
         otype = {"PAYLOAD": "PAY", "ROCKET BODY": "R/B", "DEBRIS": "DEB"}.get(otype, otype)
         rcs = (sc.get("rcs_size") or "").upper()
         if rcs in RCS_MASS_KG:
-            return {"mass_kg": RCS_MASS_KG[rcs], "hbr_m": RCS_HBR_M[rcs],
-                    "object_type": otype, "mass_source": f"satcat_rcs_{rcs.lower()}"}
-        if otype in TYPE_MASS_KG:
-            return {"mass_kg": TYPE_MASS_KG[otype], "hbr_m": TYPE_HBR_M[otype],
-                    "object_type": otype, "mass_source": "satcat_object_type"}
+            mass_kg, mass_src = RCS_MASS_KG[rcs], f"satcat_rcs_{rcs.lower()}"
+        elif otype in TYPE_MASS_KG:
+            mass_kg, mass_src = TYPE_MASS_KG[otype], "satcat_object_type"
+        else:
+            mass_kg, mass_src = None, None
+        if mass_kg is not None:
+            hbr_m, hbr_src = _screening_hbr(norad_id, name, otype)
+            return {"mass_kg": mass_kg, "hbr_m": hbr_m, "hbr_source": hbr_src,
+                    "object_type": otype, "mass_source": mass_src}
     otype = _object_type_from_name(name)
-    if otype == "UNK":
-        return {"mass_kg": TYPE_MASS_KG["UNK"], "hbr_m": TYPE_HBR_M["UNK"],
-                "object_type": "UNK", "mass_source": "default"}
-    return {"mass_kg": TYPE_MASS_KG[otype], "hbr_m": TYPE_HBR_M[otype],
-            "object_type": otype, "mass_source": "default_by_name_type"}
+    hbr_m, hbr_src = _screening_hbr(norad_id, name, otype)
+    mass_src = "default" if otype == "UNK" else "default_by_name_type"
+    return {"mass_kg": TYPE_MASS_KG[otype], "hbr_m": hbr_m, "hbr_source": hbr_src,
+            "object_type": otype, "mass_source": mass_src}
 
 
 def _agency(name: str | None, norad_id: int | None = None) -> str:

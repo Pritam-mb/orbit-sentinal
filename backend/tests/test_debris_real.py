@@ -120,3 +120,17 @@ def test_debris_alert_carries_fragment_state_reproducing_tca():
     r2, _ = sbm.propagate(np.array([fs["r_km"]]), np.array([fs["v_kms"]]), np.array([fs["ballistic_coeff_m2_kg"]]),
                           a["tca_minutes"] * 60.0 - (datetime.fromisoformat(fs["epoch_utc"]) - t0).total_seconds())
     assert np.linalg.norm(r2[0] - fr_hit[0]) < 1.0
+
+
+def test_debris_hbr_uses_screening_radius_model():
+    """A satellite has one hard-body radius in every Pc: fragment screening uses
+    the same radius model as conjunction screening (app.core.screening)."""
+    from app.core.debris_model import object_physical_properties
+    from app.core.screening import object_meta
+
+    for nid, name in [(25544, "ISS (ZARYA)"), (999_999, "TESTSAT-1"), (999_998, "COSMOS 2251 DEB")]:
+        props = object_physical_properties(nid, name)
+        ref = object_meta(nid, name, agency="n/a", object_type=props["object_type"])
+        assert props["hbr_m"] == pytest.approx(ref["radius_m"])
+        assert props["hbr_source"] == ref["radius_source"]
+    assert object_physical_properties(25544, "ISS (ZARYA)")["hbr_m"] == pytest.approx(55.0)
